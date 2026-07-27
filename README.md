@@ -67,18 +67,31 @@ bash scripts/train_vae.sh
 ```
 
 `configs/cd_formal_8B_VAE_conn.yaml` records the same paper-aligned values for
-experiments that use OmegaConf.
+experiments that use OmegaConf. Its latent `scale_factor` and `shift_factor`
+are retained release-checkpoint values: the paper does not explain how they
+were estimated, so recompute and verify them before using a newly trained VAE
+for diffusion training.
 
 ## Validation performed in this repository
 
-The lightweight preprocessing tests do not download a model:
+The lightweight tests do not download a model:
 
 ```bash
-python -m unittest -v tests/test_vae_preprocessing.py
+python -m unittest -v \
+  tests/test_vae_preprocessing.py \
+  tests/test_vae_training_utils.py
 ```
 
-A full numerical reproduction still requires the paper dataset, the gated 8B
-backbone, and multi-GPU training.
+The audited Python files compile, the shell launcher passes `bash -n`, and a
+tiny mocked encoder/decoder smoke test exercises the forward, encode, and
+teacher-forcing paths. A full numerical reproduction still requires the paper
+dataset, the gated 8B backbone, and multi-GPU training.
+
+## Reproduction audit
+
+See `REPRODUCTION_NOTES.md` for the paper-to-release discrepancy table, the
+four-versus-six latent-token ambiguity in the paper, and the boundaries of
+what can be verified without the original training run.
 
 ## Citation
 
