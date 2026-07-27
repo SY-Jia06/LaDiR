@@ -62,18 +62,14 @@ def main() -> None:
                 continue
             samples += 1
             sample = json.loads(line)
-            try:
-                cot, _ = split_cot_and_answer(
-                    str(sample["output"]),
-                    args.answer_prefix,
-                    require_answer_prefix=not args.allow_missing_prefix,
-                )
-            except ValueError:
+            output = str(sample["output"])
+            if args.answer_prefix not in output:
                 missing_prefix += 1
-                if args.allow_missing_prefix:
-                    cot = str(sample["output"])
-                else:
-                    raise
+            cot, _ = split_cot_and_answer(
+                output,
+                args.answer_prefix,
+                require_answer_prefix=not args.allow_missing_prefix,
+            )
 
             blocks = split_sentence_blocks(cot)
             block_counts.append(len(blocks))
