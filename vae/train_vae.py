@@ -1,7 +1,5 @@
 """Train the LaDiR variational autoencoder with the paper recipe."""
 
-from __future__ import annotations
-
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -28,7 +26,7 @@ class ModelArguments:
     token_substitution_prob: float = field(default=0.3)
     paper_block_mode: bool = field(default=True)
 
-    # Compatibility path only.  The paper fine-tunes every encoder parameter.
+    # Compatibility path only. The paper fine-tunes every encoder parameter.
     use_lora: bool = field(default=False)
     lora_r: int = field(default=512)
     lora_alpha: int = field(default=256)
