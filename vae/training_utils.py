@@ -8,6 +8,7 @@ from typing import Iterable
 import torch
 import wandb
 from transformers import Trainer
+from transformers.trainer_utils import get_last_checkpoint
 
 
 def run_inference(model, lines: Iterable[str]) -> list[str]:
@@ -45,10 +46,10 @@ def train_model(
         data_collator=data_collator,
     )
 
-    checkpoints = sorted(output_dir.glob("checkpoint-*"))
-    if checkpoints:
-        print(f"Resuming from {checkpoints[-1]}")
-        trainer.train(resume_from_checkpoint=str(checkpoints[-1]))
+    last_checkpoint = get_last_checkpoint(str(output_dir))
+    if last_checkpoint is not None:
+        print(f"Resuming from {last_checkpoint}")
+        trainer.train(resume_from_checkpoint=last_checkpoint)
     else:
         print("Training the paper-aligned VAE from the pretrained backbone.")
         trainer.train()
