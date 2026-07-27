@@ -158,6 +158,31 @@ class VAETeacherForcingTest(unittest.TestCase):
         for key in ("input_ids", "prompt_answer_ids", "labels"):
             self.assertEqual(batch[key].shape[1], 8)
 
+    def test_dynamic_padding_rejects_empty_batch(self):
+        collator = training_utils.DataCollatorForDynamicPadding(pad_token_id=32000)
+        with self.assertRaisesRegex(ValueError, "cannot pad an empty batch"):
+            collator([])
+
+    def test_dynamic_padding_rejects_non_positive_multiple(self):
+        for multiple in (0, -1):
+            collator = training_utils.DataCollatorForDynamicPadding(
+                pad_token_id=32000,
+                pad_to_multiple_of=multiple,
+            )
+            with self.subTest(multiple=multiple):
+                with self.assertRaisesRegex(
+                    ValueError, "pad_to_multiple_of must be positive"
+                ):
+                    collator(
+                        [
+                            {
+                                "input_ids": [1],
+                                "prompt_answer_ids": [100, 2],
+                                "labels": [-100, 2],
+                            }
+                        ]
+                    )
+
 
 if __name__ == "__main__":
     unittest.main()
