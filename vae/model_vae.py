@@ -98,7 +98,8 @@ class VAE(nn.Module):
         self.use_lora = bool(getattr(model_args, "use_lora", False))
 
         self.vocab_size_with_mem = self.vocab_size + self.mem_size
-        # Kept as a compatibility attribute; the paper path does not insert it.
+        # Kept as a compatibility attribute for older call sites; the paper path
+        # neither embeds nor inserts this delimiter.
         self.ae_token_id = self.vocab_size_with_mem
         self.icae.resize_token_embeddings(self.vocab_size_with_mem + 1)
 
@@ -112,7 +113,7 @@ class VAE(nn.Module):
         self.log_var = nn.Linear(hidden_size, self.dim, dtype=torch.bfloat16)
         self.decompress_layer = nn.Linear(self.dim, hidden_size, dtype=torch.bfloat16)
         self.memory_token_embed = nn.Embedding(
-            self.mem_size + 1,
+            self.mem_size,
             self.dim,
             padding_idx=None,
             dtype=torch.bfloat16,
@@ -351,12 +352,12 @@ class VAE(nn.Module):
         return {"loss": ce_loss, "logits": logits}
 
     def tokens_to_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """Map ordinary and VAE special IDs into frozen-decoder hidden space."""
+        """Map ordinary and VAE memory IDs into frozen-decoder hidden space."""
         embeddings = self._decoder_text_embeddings(token_ids)
         special = token_ids >= self.vocab_size
         if special.any():
             indices = token_ids[special] - self.vocab_size
-            if int(indices.max()) > self.mem_size:
+            if (indices < 0).any() or (indices >= self.mem_size).any():
                 raise ValueError("unknown VAE special token ID")
             latent_embeddings = self.memory_token_embed(indices).to(embeddings.dtype)
             embeddings[special] = self.decompress_layer(latent_embeddings)
