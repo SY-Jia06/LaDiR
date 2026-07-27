@@ -196,7 +196,7 @@ class DataCollatorForDynamicPadding:
         if not sequences:
             raise ValueError("cannot pad an empty batch")
         max_length = max(len(sequence) for sequence in sequences)
-        if self.pad_to_multiple_of:
+        if self.pad_to_multiple_of is not None:
             if self.pad_to_multiple_of <= 0:
                 raise ValueError("pad_to_multiple_of must be positive")
             max_length = (
