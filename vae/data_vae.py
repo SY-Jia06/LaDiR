@@ -2,8 +2,8 @@
 
 The LaDiR paper separates the final answer with the literal prefix
 ``The answer is`` and treats every preceding reasoning sentence as an
-independent VAE block.  This module performs that blockization before
-training, rather than asking the VAE to length-chunk a complete solution.
+independent VAE block. This module performs that blockization before training,
+rather than asking the VAE to length-chunk a complete solution.
 """
 
 from __future__ import annotations
@@ -18,8 +18,25 @@ from datasets import Dataset
 
 ANSWER_PREFIX = "The answer is"
 # Mathematical decimals such as ``3.14`` are not split because the period is
-# not followed by whitespace.  Newlines are always treated as block boundaries.
+# not followed by whitespace. Newlines are always treated as block boundaries.
 _SENTENCE_BOUNDARY = re.compile(r"(?:\r?\n)+|(?<=[.!?])\s+")
+_PERIOD_PLACEHOLDER = "\ue000"
+_COMMON_ABBREVIATIONS = (
+    "e.g.",
+    "i.e.",
+    "etc.",
+    "vs.",
+    "Dr.",
+    "Mr.",
+    "Mrs.",
+    "Ms.",
+    "Prof.",
+    "Eq.",
+    "Eqs.",
+    "Fig.",
+    "Figs.",
+    "No.",
+)
 
 
 def split_cot_and_answer(
@@ -46,11 +63,43 @@ def split_cot_and_answer(
     return cot, answer
 
 
+def _protect_abbreviation_periods(text: str) -> str:
+    """Hide periods that should not act as sentence boundaries."""
+    protected = text
+    for abbreviation in sorted(_COMMON_ABBREVIATIONS, key=len, reverse=True):
+        pattern = re.compile(re.escape(abbreviation), flags=re.IGNORECASE)
+        protected = pattern.sub(
+            lambda match: match.group(0).replace(".", _PERIOD_PLACEHOLDER),
+            protected,
+        )
+
+    # Preserve common initialisms such as U.S. and U.K. when followed by text.
+    protected = re.sub(
+        r"\b(?:[A-Za-z]\.){2,}",
+        lambda match: match.group(0).replace(".", _PERIOD_PLACEHOLDER),
+        protected,
+    )
+    return protected
+
+
 def split_sentence_blocks(cot: str) -> list[str]:
-    """Split CoT text into one-sentence blocks without external NLP models."""
+    """Split CoT text into one-sentence blocks without external NLP models.
+
+    Boundaries are newlines or terminal punctuation followed by whitespace.
+    Common abbreviations and initialisms are protected before splitting, and
+    decimals are naturally preserved. This remains a deterministic heuristic:
+    domain-specific abbreviations not listed above and punctuation without
+    whitespace may require upstream normalization. Run the block audit utility
+    on the actual training JSONL before launching the full reproduction.
+    """
     normalized = re.sub(r"[ \t]+", " ", cot.strip())
-    blocks = [piece.strip() for piece in _SENTENCE_BOUNDARY.split(normalized)]
-    return [block for block in blocks if block]
+    protected = _protect_abbreviation_periods(normalized)
+    blocks = [piece.strip() for piece in _SENTENCE_BOUNDARY.split(protected)]
+    return [
+        block.replace(_PERIOD_PLACEHOLDER, ".")
+        for block in blocks
+        if block
+    ]
 
 
 def _iter_block_records(
@@ -84,8 +133,8 @@ def _iter_block_records(
                     "question": question,
                     "chain_of_thought": block,
                     "cot_only": block,
-                    # Kept as an explicit legacy/debug option.  The paper-aligned
-                    # recipe trains with input_type=cot_only.
+                    # Kept as an explicit debug option. The paper-aligned recipe
+                    # trains with input_type=cot_only.
                     "full_format": f"{question}\n{block}",
                     "final_answer": final_answer,
                     "block_index": block_index,
@@ -121,7 +170,7 @@ def load_data(
 ):
     """Load and blockize VAE data.
 
-    A dedicated validation JSONL is used when present.  Otherwise the training
+    A dedicated validation JSONL is used when present. Otherwise the training
     block dataset is split deterministically using ``test_size``.
     """
     if input_type not in {"cot_only", "full_format"}:
