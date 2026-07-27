@@ -1,14 +1,13 @@
 """Paper-aligned variational autoencoder for LaDiR thought blocks.
 
-The implementation retains the repository's ICAE-style design: a pretrained
-causal LLM encodes a text block followed by learnable memory tokens, linear
+The implementation keeps the released ICAE-style design: a pretrained causal
+LLM encodes one reasoning sentence followed by learnable memory tokens, linear
 heads parameterize a Gaussian latent distribution, and a separate frozen copy
-of the pretrained LLM reconstructs the text under teacher forcing.
+of the pretrained LLM reconstructs the sentence under teacher forcing.
 """
 
 from __future__ import annotations
 
-import math
 from typing import Optional
 
 import torch
@@ -40,17 +39,9 @@ def freeze_model(model: nn.Module) -> None:
 class VAE(nn.Module):
     """Variational autoencoder for one-sentence LaDiR thought blocks.
 
-    Paper-aligned defaults are supplied by ``train_vae.py``:
-
-    * full-parameter encoder fine-tuning;
-    * four learnable latent tokens per sentence block;
-    * latent dimension 512;
-    * latent Gaussian augmentation with standard deviation 3;
-    * encoder token substitution probability 0.3;
-    * a separate frozen pretrained decoder.
-
-    LoRA and legacy multi-segment compression remain available as explicit
-    compatibility options, but are disabled by the reproduction recipe.
+    The reproduction path intentionally supports the paper's Llama-3.1 causal
+    backbone and fixed one-sentence blocks only. LoRA remains an optional encoder
+    optimization, but the paper recipe fine-tunes the full encoder.
     """
 
     def __init__(self, model_args, training_args, lora_config=None):
@@ -58,18 +49,31 @@ class VAE(nn.Module):
         self.model_args = model_args
         self.training_args = training_args
         self.model_name = model_args.model_name_or_path
-        self.is_trainable_model = bool(getattr(model_args, "train", True))
+
+        self.paper_block_mode = bool(getattr(model_args, "paper_block_mode", True))
+        if not self.paper_block_mode:
+            raise ValueError(
+                "paper_block_mode=False is not supported by the paper-aligned "
+                "decoder interface. Pre-blockize each CoT sentence and keep "
+                "paper_block_mode=True."
+            )
 
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, use_fast=False)
         self.icae = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             torch_dtype=torch.bfloat16,
         )
-        # The paper uses an independent frozen pretrained LLM as the decoder.
         self.decoder = AutoModelForCausalLM.from_pretrained(
             self.model_name,
             torch_dtype=torch.bfloat16,
         )
+
+        model_type = getattr(self.icae.config, "model_type", None)
+        if model_type != "llama" or not hasattr(self.icae, "model"):
+            raise ValueError(
+                "This reproduction currently supports a LlamaForCausalLM "
+                "backbone only; use the paper's meta-llama/Llama-3.1-8B model."
+            )
 
         self.base_vocab_size = self.icae.config.vocab_size
         self.vocab_size = self.base_vocab_size + 1  # reserve one ID for padding
@@ -80,17 +84,21 @@ class VAE(nn.Module):
             raise ValueError("The selected tokenizer must define eos_token_id.")
 
         self.mem_size = int(training_args.fixed_mem_size)
+        if self.mem_size <= 0:
+            raise ValueError("fixed_mem_size must be positive")
         self.mean_compression_rate = int(training_args.mean_compression_rate)
-        self.paper_block_mode = bool(getattr(model_args, "paper_block_mode", True))
         self.dim = int(getattr(model_args, "latent_dim", 512))
         self.beta = float(model_args.beta)
         self.latent_noise_std = float(getattr(model_args, "latent_noise_std", 3.0))
         self.token_substitution_prob = float(
             getattr(model_args, "token_substitution_prob", 0.3)
         )
+        if not 0.0 <= self.token_substitution_prob <= 1.0:
+            raise ValueError("token_substitution_prob must be in [0, 1]")
         self.use_lora = bool(getattr(model_args, "use_lora", False))
 
         self.vocab_size_with_mem = self.vocab_size + self.mem_size
+        # Kept as a compatibility attribute; the paper path does not insert it.
         self.ae_token_id = self.vocab_size_with_mem
         self.icae.resize_token_embeddings(self.vocab_size_with_mem + 1)
 
@@ -142,19 +150,20 @@ class VAE(nn.Module):
         print(f"Finished loading from {restore_from}")
 
     def _encoder_model(self):
-        if self.use_lora:
-            return self.icae.get_base_model()
-        return self.icae
+        return self.icae.get_base_model() if self.use_lora else self.icae
 
     def _encoder_embedding_layer(self):
         return self._encoder_model().get_input_embeddings()
 
     def _encoder_backbone(self):
-        # AutoModelForCausalLM would otherwise materialize vocabulary logits
-        # that the VAE encoder never uses. Calling the transformer backbone
-        # preserves the same hidden states while avoiding that large projection.
+        """Return the validated Llama transformer without its unused LM head."""
         encoder_model = self._encoder_model()
-        return getattr(encoder_model, "model", encoder_model)
+        backbone = getattr(encoder_model, "model", None)
+        if backbone is None:
+            raise RuntimeError(
+                "Expected a LlamaForCausalLM-style `.model` transformer backbone."
+            )
+        return backbone
 
     def _decoder_embedding_layer(self):
         return self.decoder.get_input_embeddings()
@@ -165,7 +174,7 @@ class VAE(nn.Module):
         return position_ids.clamp_min_(0)
 
     def _decoder_text_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
-        """Embed ordinary decoder tokens without indexing custom VAE token IDs."""
+        """Embed ordinary decoder tokens without indexing custom VAE IDs."""
         safe_ids = token_ids.clone()
         custom_or_pad = safe_ids >= self.base_vocab_size
         safe_ids[custom_or_pad] = 0
@@ -191,32 +200,23 @@ class VAE(nn.Module):
         return torch.where(replace, random_ids, input_ids)
 
     def compute_num_segments(self, total_length: int) -> int:
+        """Return the single paper block; length chunking is deliberately disabled."""
         if total_length <= 0:
             raise ValueError("total_length must be positive")
-        # LaDiR blockizes the dataset before VAE encoding: one sentence is one
-        # fixed-size latent block. The old length-driven segmentation remains an
-        # opt-in compatibility path only.
-        if self.paper_block_mode:
-            return 1
-        denominator = self.mem_size * self.mean_compression_rate
-        if denominator <= 0:
-            raise ValueError("mem_size * mean_compression_rate must be positive")
-        return math.ceil(total_length / denominator)
+        return 1
 
     @staticmethod
     def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         std = torch.exp(0.5 * logvar)
         return mu + torch.randn_like(std) * std
 
-    def _encode_segment(
+    def _encode_block(
         self,
-        segment_input_ids: torch.Tensor,
+        input_ids: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        batch_size = segment_input_ids.size(0)
-        memory_ids = self.append_sequence.to(segment_input_ids.device).expand(
-            batch_size, -1
-        )
-        encoder_ids = torch.cat([segment_input_ids, memory_ids], dim=1)
+        batch_size = input_ids.size(0)
+        memory_ids = self.append_sequence.to(input_ids.device).expand(batch_size, -1)
+        encoder_ids = torch.cat([input_ids, memory_ids], dim=1)
         memory_mask = encoder_ids >= self.vocab_size
         attention_mask = encoder_ids.ne(self.pad_token_id)
 
@@ -238,9 +238,30 @@ class VAE(nn.Module):
         )
         hidden = getattr(outputs, "last_hidden_state", None)
         if hidden is None:
-            hidden = outputs.hidden_states[-1]
+            hidden_states = getattr(outputs, "hidden_states", None)
+            if not hidden_states:
+                raise RuntimeError("encoder backbone returned no hidden states")
+            hidden = hidden_states[-1]
         memory_hidden = hidden[memory_mask].view(batch_size, self.mem_size, -1)
         return self.mean(memory_hidden), self.log_var(memory_hidden)
+
+    def _memory_mask(
+        self,
+        prompt_answer_ids: torch.Tensor,
+        batch_size: int,
+    ) -> torch.Tensor:
+        mask = (
+            (prompt_answer_ids >= self.vocab_size)
+            & (prompt_answer_ids < self.vocab_size + self.mem_size)
+        )
+        expected = batch_size * self.mem_size
+        actual = int(mask.sum())
+        if actual != expected:
+            raise ValueError(
+                "Decoder prompt must contain exactly one paper block of memory "
+                f"tokens per example: expected {expected}, found {actual}."
+            )
+        return mask
 
     def forward(
         self,
@@ -250,42 +271,23 @@ class VAE(nn.Module):
     ):
         if labels is None:
             raise ValueError("labels are required for VAE training")
+        if input_ids.ndim != 2:
+            raise ValueError("input_ids must have shape [batch, sequence]")
 
         input_ids = self._apply_token_substitution(input_ids)
-        batch_size, total_length = input_ids.shape
+        batch_size = input_ids.size(0)
         prompt_answer_ids = prompt_answer_ids.reshape(batch_size, -1)
-        num_segments = self.compute_num_segments(total_length)
-        segment_length = math.ceil(total_length / num_segments)
 
-        latent_blocks = []
-        kl_terms = []
-        for segment_idx in range(num_segments):
-            start_idx = segment_idx * segment_length
-            end_idx = min((segment_idx + 1) * segment_length, total_length)
-            mu, logvar = self._encode_segment(input_ids[:, start_idx:end_idx])
-            latent = self.reparameterize(mu, logvar)
-            if self.training and self.latent_noise_std > 0:
-                latent = latent + torch.randn_like(latent) * self.latent_noise_std
-            latent_blocks.append(latent)
-            kl_terms.append(
-                -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-            )
-
-        compressed = torch.cat(latent_blocks, dim=1)
-        kl_loss = torch.stack(kl_terms).mean()
+        mu, logvar = self._encode_block(input_ids)
+        compressed = self.reparameterize(mu, logvar)
+        if self.training and self.latent_noise_std > 0:
+            compressed = compressed + torch.randn_like(compressed) * self.latent_noise_std
+        kl_loss = -0.5 * torch.mean(
+            1 + logvar - mu.pow(2) - logvar.exp()
+        )
 
         prompt_answer_embs = self._decoder_text_embeddings(prompt_answer_ids)
-        decoder_mem_mask = (
-            (prompt_answer_ids >= self.vocab_size)
-            & (prompt_answer_ids < self.vocab_size + compressed.size(1))
-        )
-        expected_slots = batch_size * compressed.size(1)
-        if int(decoder_mem_mask.sum()) != expected_slots:
-            raise ValueError(
-                "Decoder prompt contains a different number of memory-token "
-                f"positions ({int(decoder_mem_mask.sum())}) than latent slots "
-                f"({expected_slots})."
-            )
+        decoder_mem_mask = self._memory_mask(prompt_answer_ids, batch_size)
         decompressed = self.decompress_layer(compressed)
         prompt_answer_embs[decoder_mem_mask] = decompressed.reshape(
             -1, decompressed.size(-1)
@@ -319,13 +321,13 @@ class VAE(nn.Module):
         labels: torch.LongTensor,
     ):
         batch_size = memory_slots.size(0)
+        if memory_slots.size(1) != self.mem_size:
+            raise ValueError(
+                f"expected {self.mem_size} latent slots, received {memory_slots.size(1)}"
+            )
         prompt_answer_ids = prompt_answer_ids.reshape(batch_size, -1)
         prompt_answer_embs = self._decoder_text_embeddings(prompt_answer_ids)
-
-        decoder_mem_mask = (
-            (prompt_answer_ids >= self.vocab_size)
-            & (prompt_answer_ids < self.vocab_size + memory_slots.size(1))
-        )
+        decoder_mem_mask = self._memory_mask(prompt_answer_ids, batch_size)
         decompressed = self.decompress_layer(
             memory_slots.to(self.decompress_layer.weight.dtype)
         )
@@ -353,9 +355,10 @@ class VAE(nn.Module):
         embeddings = self._decoder_text_embeddings(token_ids)
         special = token_ids >= self.vocab_size
         if special.any():
-            latent_embeddings = self.memory_token_embed(
-                token_ids[special] - self.vocab_size
-            ).to(embeddings.dtype)
+            indices = token_ids[special] - self.vocab_size
+            if int(indices.max()) > self.mem_size:
+                raise ValueError("unknown VAE special token ID")
+            latent_embeddings = self.memory_token_embed(indices).to(embeddings.dtype)
             embeddings[special] = self.decompress_layer(latent_embeddings)
         return embeddings
 
@@ -364,38 +367,26 @@ class VAE(nn.Module):
         input_ids: torch.LongTensor,
         return_sample: Optional[str] = None,
     ):
-        """Encode text blocks as posterior parameters, samples, or posterior means.
+        """Encode one sentence block as posterior parameters, sample, or mean.
 
         ``return_sample='sample'`` applies only VAE reparameterization. The
-        robustness noise with std=3 is a VAE-training augmentation and is not
-        applied when exporting oracle latents for the diffusion model.
+        robustness noise with std=3 is a training augmentation and is not
+        applied when exporting oracle latents for diffusion training.
         """
-        batch_size, total_length = input_ids.shape
-        num_segments = self.compute_num_segments(total_length)
-        segment_length = math.ceil(total_length / num_segments)
-
-        means = []
-        logvars = []
-        for segment_idx in range(num_segments):
-            start_idx = segment_idx * segment_length
-            end_idx = min((segment_idx + 1) * segment_length, total_length)
-            mu, logvar = self._encode_segment(input_ids[:, start_idx:end_idx])
-            means.append(mu)
-            logvars.append(logvar)
-
-        mean = torch.cat(means, dim=1)
-        logvar = torch.cat(logvars, dim=1)
+        mu, logvar = self._encode_block(input_ids)
         if return_sample == "parameters":
-            return mean, logvar
+            return mu, logvar
         if return_sample in (None, "", "sample"):
-            return self.reparameterize(mean, logvar)
+            return self.reparameterize(mu, logvar)
         if return_sample == "mean":
-            return mean
+            return mu
         raise ValueError(
             "return_sample must be one of None, '', 'sample', 'mean', or 'parameters'"
         )
 
     def _tokenize_batch(self, texts: list[str], max_length: int = 5120) -> torch.Tensor:
+        if not texts:
+            raise ValueError("texts must not be empty")
         encoded = [
             self.tokenizer(
                 text,
@@ -407,6 +398,8 @@ class VAE(nn.Module):
             for text in texts
         ]
         max_len = max(len(ids) for ids in encoded)
+        if max_len <= 0:
+            raise ValueError("tokenizer produced an empty sequence")
         input_ids = torch.full(
             (len(encoded), max_len),
             self.pad_token_id,
@@ -434,14 +427,15 @@ class VAE(nn.Module):
         memory_slots: torch.Tensor,
         max_new_tokens: int = 256,
     ) -> list[str]:
+        if memory_slots.ndim != 3 or memory_slots.size(1) != self.mem_size:
+            raise ValueError(
+                f"memory_slots must have shape [batch, {self.mem_size}, latent_dim]"
+            )
         batch_size = memory_slots.size(0)
         memory_slots = memory_slots.to(
             device=self.device,
             dtype=self.decompress_layer.weight.dtype,
         )
-        # Figure 7 conditions the frozen decoder directly on the sampled
-        # thought tokens. The first text token is predicted from the final
-        # latent position; there is no release-only AE delimiter.
         prefix = self.decompress_layer(memory_slots)
 
         outputs = self.decoder(inputs_embeds=prefix, use_cache=True, return_dict=True)
