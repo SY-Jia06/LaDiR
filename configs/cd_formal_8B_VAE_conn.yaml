@@ -1,24 +1,21 @@
-run_name: vae_diffusion_experiment
+run_name: vae_paper_reproduction
 
 trainer:
   run_name: ${run_name}
   do_train: true
-  num_train_epochs: 1000
-  per_device_train_batch_size: 64
+  num_train_epochs: 2
+  # With the released 8-GPU launcher this gives the paper's global batch 128.
+  per_device_train_batch_size: 16
   gradient_accumulation_steps: 1
-  bf16: true  # This is amp, we want it now
-  save_strategy: steps
-  save_steps: 2500
-  learning_rate: 1e-4
+  bf16: true
+  save_strategy: epoch
+  learning_rate: 2e-5
   max_grad_norm: 1.0
-  weight_decay: 0.02
-  # warmup_ratio: 0.003
+  weight_decay: 0.03
   warmup_steps: 1000
-  lr_scheduler_type: constant
-  logging_steps: 1
+  lr_scheduler_type: cosine
+  logging_steps: 10
   ddp_backend: nccl
-  #deepspeed: ds_config_zero3.json
-  #fsdp: none
   fsdp: full_shard auto_wrap
   fsdp_config:
     backward_prefetch: backward_pre
@@ -29,20 +26,11 @@ trainer:
       - LlamaDecoderLayer
     use_orig_params: true
     activation_checkpointing: true
-  accelerator_config:
-    dispatch_batches: false
-  gradient_checkpointing: false
   report_to: wandb
-  output_dir: ckpt/${run_name}
-  dataloader_num_workers: 16
+  output_dir: checkpoints/${run_name}
+  dataloader_num_workers: 8
   remove_unused_columns: false
-  disable_tqdm: false
-  adam_beta1: 0.9
-  adam_beta2: 0.95
-  overwrite_output_dir: True
-  per_device_eval_batch_size: 1
   eval_strategy: "no"
-
 
 model:
   llm_model_name_or_path: meta-llama/Llama-3.1-8B
@@ -57,23 +45,30 @@ model:
   emu2_expr: false
   subsampling: false
 
-dataset:
-  train_file: data/train.jsonl
-  val_file: data/val.jsonl
-  local: data/
-  num_canonical_nodes: 120
-  shuffle: true
-  per_device_batch_size: ${trainer.per_device_train_batch_size}
-
 ae:
+  # The paper fine-tunes all VAE encoder parameters and freezes the decoder.
+  use_lora: false
   lora_r: 512
   lora_alpha: 256
   lora_dropout: 0.05
+  latent_dim: 512
+  fixed_mem_size: 4
+  beta: 1e-5
+  latent_noise_std: 3.0
+  token_substitution_prob: 0.3
+  paper_block_mode: true
   mean_compression_rate: 1
-  fixed_mem_size: 3
-  icae_ckpt: "checkpoints/vae_model/model.safetensors"
+  icae_ckpt: "checkpoints/vae_paper/model.safetensors"
   scale_factor: 0.2154
   shift_factor: 0.2192
+
+dataset:
+  train_file: data/vae_train.jsonl
+  val_file: data/vae_val.jsonl
+  input_type: cot_only
+  answer_prefix: "The answer is"
+  require_answer_prefix: true
+  preprocessing_num_workers: 16
 
 log_dir: wandb/logs
 wandb_dir: wandb
