@@ -1,80 +1,105 @@
 # LaDiR: Latent Diffusion Enhances LLMs for Text Reasoning
 
-Official repository for the paper:  
+Paper-aligned reproduction code for:
+
 **[LaDiR: Latent Diffusion Enhances LLMs for Text Reasoning](https://arxiv.org/abs/2510.04573)**  
+Published at ICLR 2026.
 
----
+LaDiR first trains a variational autoencoder (VAE) that maps one reasoning
+sentence to a fixed block of continuous thought tokens. A latent diffusion
+reasoner is then trained over these blocks.
 
-## 🧠 Overview
+## Installation
 
-**LaDiR (Latent Diffusion Reasoner)** introduces a new reasoning framework that unifies the expressiveness of **continuous latent representations** with the **iterative refinement capability** of diffusion models for large language models (LLMs).
+```bash
+git clone https://github.com/SY-Jia06/LaDiR.git
+cd LaDiR
+python -m venv venv
+source venv/bin/activate
+pip install -r requirements.txt
+```
 
-Instead of generating reasoning chains autoregressively, LaDiR performs **latent diffusion over thought tokens**, enabling:
+Access to the selected Hugging Face backbone is required. The paper recipe uses
+`meta-llama/Llama-3.1-8B`.
 
-- Iterative semantic self-refinement  
-- Diverse parallel reasoning trajectories  
-- A flexible trade-off between accuracy and test-time compute  
+## Data
 
----
+Create `data/vae_train.jsonl` and, optionally, `data/vae_val.jsonl`:
 
+```json
+{"input": "question text", "output": "First reasoning sentence. Second reasoning sentence. The answer is: final answer."}
+```
 
-## 🛠️ Installation
+The VAE loader follows the paper's blockization procedure:
 
-1. **Clone the repository**:
-   ```bash
-   git clone <repository-url>
-   ```
+1. split CoT from the final answer with the literal prefix `The answer is`;
+2. split the CoT into sentences;
+3. train the VAE on each sentence as one independent latent block.
 
-2. **Create a virtual environment**:
-   ```bash
-   python -m venv venv
-   source venv/bin/activate  # On Windows: venv\Scripts\activate
-   ```
+By default, examples missing the answer prefix raise an error instead of being
+silently trained with a different data format.
 
-3. **Install dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+## Train the VAE
 
-## 🎯 Usage
+```bash
+bash scripts/train_vae.sh
+```
 
-### Training the VAE Model
+The launcher defaults to the paper recipe:
 
-1. **Prepare your dataset** in JSONL format with the following structure:
-   ```json
-   {"input": "question text", "output": "reasoning chain"}
-   ```
+- full-parameter fine-tuning of the LLM encoder;
+- a separate frozen pretrained LLM decoder;
+- latent dimension 512;
+- four latent tokens per sentence block;
+- KL weight `1e-5`;
+- latent Gaussian augmentation with standard deviation 3;
+- encoder-token substitution probability 0.3;
+- learning rate `2e-5`, global batch size 128, two epochs.
 
-2. **Configure training parameters** in `configs/cd_formal_8B_VAE_conn.yaml`
+The number of GPUs and paths can be overridden without editing the script:
 
-3. **Run VAE training**:
-   ```bash
-   cd vae
-   bash ..scripts/train_vae.sh
-   ```
+```bash
+NUM_GPUS=8 \
+MODEL_NAME_OR_PATH=/path/to/Llama-3.1-8B \
+OUTPUT_DIR=/path/to/vae_ckpt \
+REPORT_TO=none \
+bash scripts/train_vae.sh
+```
 
-### Training the Diffusion Model
-   ```bash
-   bash scripts/train_vae.sh
-   ```
+`configs/cd_formal_8B_VAE_conn.yaml` records the same paper-aligned values for
+experiments that use OmegaConf. Its latent `scale_factor` and `shift_factor`
+are retained release-checkpoint values: the paper does not explain how they
+were estimated, so recompute and verify them before using a newly trained VAE
+for diffusion training.
 
-## ⚙️ Configuration
+## Validation performed in this repository
 
-The model can be configured through YAML files in the `configs/` directory. Key parameters include:
+The lightweight tests do not download a model:
 
-- **Model**: Base language model path, LoRA configuration
-- **Training**: Learning rate, batch size, number of steps
-- **VAE**: Compression rate, memory size, beta for KL loss
-- **Dataset**: Training file paths, data processing options
+```bash
+python -m unittest -v \
+  tests/test_vae_preprocessing.py \
+  tests/test_vae_training_utils.py
+```
 
----
+The audited Python files compile, the shell launcher passes `bash -n`, and a
+tiny mocked encoder/decoder smoke test exercises the forward, encode, and
+teacher-forcing paths. A full numerical reproduction still requires the paper
+dataset, the gated 8B backbone, and multi-GPU training.
 
-If you find this work useful, please consider citing:
+## Reproduction audit
+
+See `REPRODUCTION_NOTES.md` for the paper-to-release discrepancy table, the
+four-versus-six latent-token ambiguity in the paper, and the boundaries of
+what can be verified without the original training run.
+
+## Citation
 
 ```bibtex
-@article{kang2025ladir,
+@inproceedings{kang2026ladir,
   title={LaDiR: Latent Diffusion Enhances LLMs for Text Reasoning},
-  author={Kang, Haoqiang and Zhang, Yizhe and Kuang, Nikki Lijing and Majamäki, Nicklas and Jaitly, Navdeep and Ma, Yi-An and Qin, Lianhui},
-  journal={arXiv preprint arXiv:2510.08558},
-  year={2025}
+  author={Kang, Haoqiang and Zhang, Yizhe and Kuang, Nikki Lijing and Majamaki, Nicklas and Jaitly, Navdeep and Ma, Yi-An and Qin, Lianhui},
+  booktitle={International Conference on Learning Representations},
+  year={2026}
 }
+```
