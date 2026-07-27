@@ -59,6 +59,11 @@ ae:
   paper_block_mode: true
   mean_compression_rate: 1
   icae_ckpt: "checkpoints/vae_paper/model.safetensors"
+
+  # These affine statistics are not specified in the paper. The values below
+  # came with the released downstream configuration and must not be assumed to
+  # match a newly trained VAE checkpoint. Measure the new checkpoint's latent
+  # distribution before using them in diffusion training.
   scale_factor: 0.2154
   shift_factor: 0.2192
 
