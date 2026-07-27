@@ -15,14 +15,14 @@ import torch
 wandb_stub = types.ModuleType("wandb")
 wandb_stub.run = None
 wandb_stub.log = lambda *args, **kwargs: None
-sys.modules.setdefault("wandb", wandb_stub)
+sys.modules["wandb"] = wandb_stub
 
 transformers_stub = types.ModuleType("transformers")
 transformers_stub.Trainer = object
 trainer_utils_stub = types.ModuleType("transformers.trainer_utils")
 trainer_utils_stub.get_last_checkpoint = lambda _: None
-sys.modules.setdefault("transformers", transformers_stub)
-sys.modules.setdefault("transformers.trainer_utils", trainer_utils_stub)
+sys.modules["transformers"] = transformers_stub
+sys.modules["transformers.trainer_utils"] = trainer_utils_stub
 
 MODULE_PATH = Path(__file__).parents[1] / "vae" / "training_utils.py"
 spec = importlib.util.spec_from_file_location("training_utils", MODULE_PATH)
@@ -35,35 +35,43 @@ class FakeTokenizer:
     """Minimal batch tokenizer with deterministic token IDs."""
 
     def __call__(self, texts, **kwargs):
-        del kwargs
-        return {
-            "input_ids": [
-                [10 + index for index, _ in enumerate(text.split())]
-                for text in texts
-            ]
-        }
+        max_length = kwargs.get("max_length")
+        truncation = kwargs.get("truncation", False)
+        encoded = []
+        for text in texts:
+            ids = [10 + index for index, _ in enumerate(text.split())]
+            if truncation and max_length is not None:
+                ids = ids[:max_length]
+            encoded.append(ids)
+        return {"input_ids": encoded}
+
+
+def tokenize(**overrides):
+    kwargs = {
+        "examples": {
+            "cot_only": ["alpha beta"],
+            "chain_of_thought": ["alpha beta"],
+        },
+        "tokenizer": FakeTokenizer(),
+        "model_max_length": 32,
+        "mem_size": 4,
+        "min_tokens_for_lm": 64,
+        "mean_compression_rate": 1,
+        "add_special_token_for_lm": False,
+        "leave_tokens_for_lm": 8,
+        "ae_token_id": 999,
+        "eos_id": 2,
+        "mem": [100, 101, 102, 103],
+        "input_type": "cot_only",
+        "lm_ratio": 0.0,
+    }
+    kwargs.update(overrides)
+    return training_utils.pretrain_tokenize_function(**kwargs)
 
 
 class VAETeacherForcingTest(unittest.TestCase):
     def test_latents_are_followed_directly_by_text(self):
-        result = training_utils.pretrain_tokenize_function(
-            {
-                "cot_only": ["alpha beta"],
-                "chain_of_thought": ["alpha beta"],
-            },
-            tokenizer=FakeTokenizer(),
-            model_max_length=32,
-            mem_size=4,
-            min_tokens_for_lm=64,
-            mean_compression_rate=1,
-            add_special_token_for_lm=False,
-            leave_tokens_for_lm=8,
-            ae_token_id=999,
-            eos_id=2,
-            mem=[100, 101, 102, 103],
-            input_type="cot_only",
-            lm_ratio=0.0,
-        )
+        result = tokenize()
 
         self.assertEqual(result["input_ids"], [[10, 11]])
         self.assertEqual(
@@ -75,6 +83,27 @@ class VAETeacherForcingTest(unittest.TestCase):
             [[-100, -100, -100, -100, 10, 11, 2]],
         )
         self.assertNotIn(999, result["prompt_answer_ids"][0])
+
+    def test_encoder_and_decoder_respect_model_max_length(self):
+        result = tokenize(
+            examples={
+                "cot_only": ["a b c d e f g h"],
+                "chain_of_thought": ["a b c d e f g h"],
+            },
+            model_max_length=7,
+        )
+        decoder_ids = result["prompt_answer_ids"][0]
+        self.assertEqual(len(result["input_ids"][0]), 3)
+        self.assertEqual(len(decoder_ids), 7)
+        self.assertEqual(decoder_ids[-1], 2)
+
+    def test_rejects_non_zero_lm_ratio(self):
+        with self.assertRaisesRegex(ValueError, "lm_ratio"):
+            tokenize(lm_ratio=0.5)
+
+    def test_rejects_memory_id_count_mismatch(self):
+        with self.assertRaisesRegex(ValueError, "mem_size"):
+            tokenize(mem=[100, 101, 102])
 
     def test_dynamic_padding_uses_separate_fill_values(self):
         collator = training_utils.DataCollatorForDynamicPadding(pad_token_id=32000)
@@ -101,6 +130,58 @@ class VAETeacherForcingTest(unittest.TestCase):
             )
         )
         self.assertTrue(torch.equal(batch["labels"][1], torch.tensor([-100, 2, -100])))
+
+    def test_dynamic_padding_respects_pad_to_multiple_of(self):
+        examples = [
+            {
+                "input_ids": [1, 2, 3],
+                "prompt_answer_ids": [100, 101],
+                "labels": [-100, 10],
+            },
+            {
+                "input_ids": [4, 5],
+                "prompt_answer_ids": [102],
+                "labels": [-100],
+            },
+            {
+                "input_ids": [6],
+                "prompt_answer_ids": [103, 104, 105],
+                "labels": [-100, 11, 12],
+            },
+        ]
+        collator = training_utils.DataCollatorForDynamicPadding(
+            pad_token_id=32000,
+            pad_to_multiple_of=8,
+        )
+        batch = collator(examples)
+
+        for key in ("input_ids", "prompt_answer_ids", "labels"):
+            self.assertEqual(batch[key].shape[1], 8)
+
+    def test_dynamic_padding_rejects_empty_batch(self):
+        collator = training_utils.DataCollatorForDynamicPadding(pad_token_id=32000)
+        with self.assertRaisesRegex(ValueError, "cannot pad an empty batch"):
+            collator([])
+
+    def test_dynamic_padding_rejects_non_positive_multiple(self):
+        for multiple in (0, -1):
+            collator = training_utils.DataCollatorForDynamicPadding(
+                pad_token_id=32000,
+                pad_to_multiple_of=multiple,
+            )
+            with self.subTest(multiple=multiple):
+                with self.assertRaisesRegex(
+                    ValueError, "pad_to_multiple_of must be positive"
+                ):
+                    collator(
+                        [
+                            {
+                                "input_ids": [1],
+                                "prompt_answer_ids": [100, 2],
+                                "labels": [-100, 2],
+                            }
+                        ]
+                    )
 
 
 if __name__ == "__main__":

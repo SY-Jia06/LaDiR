@@ -19,8 +19,10 @@ source venv/bin/activate
 pip install -r requirements.txt
 ```
 
-Access to the selected Hugging Face backbone is required. The paper recipe uses
-`meta-llama/Llama-3.1-8B`.
+Access to the selected Hugging Face backbone is required. The paper recipe and
+this audited implementation use `meta-llama/Llama-3.1-8B`; other causal-LM
+architectures are rejected rather than silently routed through an unverified
+backbone interface.
 
 ## Data
 
@@ -37,7 +39,16 @@ The VAE loader follows the paper's blockization procedure:
 3. train the VAE on each sentence as one independent latent block.
 
 By default, examples missing the answer prefix raise an error instead of being
-silently trained with a different data format.
+silently trained with a different data format. Sentence splitting is a
+reproducible heuristic that protects decimals, common abbreviations, and
+initialisms. Audit the real data before an expensive training run:
+
+```bash
+python scripts/audit_vae_blocks.py --input data/vae_train.jsonl --show 20
+```
+
+The audit reports blocks per sample, words per block, missing answer prefixes,
+and unusually short or long blocks for manual inspection.
 
 ## Train the VAE
 
@@ -55,6 +66,10 @@ The launcher defaults to the paper recipe:
 - latent Gaussian augmentation with standard deviation 3;
 - encoder-token substitution probability 0.3;
 - learning rate `2e-5`, global batch size 128, two epochs.
+
+The paper path accepts one pre-blockized sentence at a time. The release's
+length-driven multi-segment mode is deliberately rejected because its repeated
+memory-token interface does not match the paper decoder layout.
 
 The number of GPUs and paths can be overridden without editing the script:
 
@@ -79,13 +94,17 @@ The lightweight tests do not download a model:
 ```bash
 python -m unittest -v \
   tests/test_vae_preprocessing.py \
-  tests/test_vae_training_utils.py
+  tests/test_vae_training_utils.py \
+  tests/test_vae_model_interface.py
 ```
 
-The audited Python files compile, the shell launcher passes `bash -n`, and a
-tiny mocked encoder/decoder smoke test exercises the forward, encode, and
-teacher-forcing paths. A full numerical reproduction still requires the paper
-dataset, the gated 8B backbone, and multi-GPU training.
+The suite covers sentence splitting, decoder length budgeting, error paths,
+padding-to-multiple behavior, the fixed paper-block contract, forward loss,
+and posterior shapes with mocked encoder/decoder models. The audited Python
+files compile and the shell launcher passes `bash -n`.
+
+A full numerical reproduction still requires the paper dataset, the gated 8B
+backbone, and multi-GPU training.
 
 ## Reproduction audit
 
