@@ -80,9 +80,11 @@ def pretrain_tokenize_function(
 ):
     """Tokenize one sentence per fixed-size latent block.
 
-    Several arguments are retained for call-site compatibility with the
-    original release.  The paper-aligned recipe is a pure autoencoding
-    objective (``lm_ratio=0``) and does not insert the release-only AE token.
+    The decoder context is limited to ``model_max_length`` including the memory
+    prefix and terminal EOS token. Several arguments are retained for call-site
+    compatibility with the original release. The paper-aligned recipe is a pure
+    autoencoding objective (``lm_ratio=0``) and does not insert the release-only
+    AE token.
     """
     del (
         min_tokens_for_lm,
@@ -94,7 +96,15 @@ def pretrain_tokenize_function(
     if lm_ratio != 0:
         raise ValueError("Paper-aligned VAE pretraining requires lm_ratio=0")
     if len(mem) != mem_size:
-        raise ValueError(f"expected {mem_size} memory IDs, received {len(mem)}")
+        raise ValueError(
+            f"mem_size={mem_size} requires exactly {mem_size} memory IDs, "
+            f"received {len(mem)}"
+        )
+    if model_max_length <= mem_size:
+        raise ValueError(
+            "model_max_length must be greater than mem_size so the decoder "
+            "has room for at least one target token"
+        )
 
     encoder_texts = examples[input_type]
     target_texts = examples["chain_of_thought"]
@@ -105,10 +115,14 @@ def pretrain_tokenize_function(
         padding=False,
         return_attention_mask=False,
     )
+
+    # Reserve the memory prefix inside the decoder's context budget. EOS is
+    # enforced below by replacing the last target token when the budget is full.
+    target_budget = model_max_length - mem_size
     target_outputs = tokenizer(
         target_texts,
         truncation=True,
-        max_length=model_max_length,
+        max_length=target_budget,
         padding=False,
         return_attention_mask=False,
     )
@@ -116,15 +130,22 @@ def pretrain_tokenize_function(
     prompt_answer_ids = []
     labels = []
     for target_ids in target_outputs["input_ids"]:
-        target_ids = list(target_ids)
-        if not target_ids or target_ids[-1] != eos_id:
-            target_ids.append(eos_id)
+        target_ids = list(target_ids[:target_budget])
+        if not target_ids:
+            target_ids = [eos_id]
+        elif target_ids[-1] != eos_id:
+            if len(target_ids) == target_budget:
+                target_ids[-1] = eos_id
+            else:
+                target_ids.append(eos_id)
 
         # Figure 7 in the paper conditions the frozen decoder directly on
-        # [latent thought tokens, teacher-forced text embeddings].  There is no
+        # [latent thought tokens, teacher-forced text embeddings]. There is no
         # additional AE delimiter between the two.
         decoder_ids = list(mem) + target_ids
         decoder_labels = [-100] * mem_size + target_ids
+        if len(decoder_ids) > model_max_length:
+            raise AssertionError("decoder sequence exceeded model_max_length")
         prompt_answer_ids.append(decoder_ids)
         labels.append(decoder_labels)
 
@@ -168,8 +189,12 @@ class DataCollatorForDynamicPadding:
         }
 
     def dynamic_padding(self, sequences, fill_value=-100):
+        if not sequences:
+            raise ValueError("cannot pad an empty batch")
         max_length = max(len(sequence) for sequence in sequences)
         if self.pad_to_multiple_of:
+            if self.pad_to_multiple_of <= 0:
+                raise ValueError("pad_to_multiple_of must be positive")
             max_length = (
                 (max_length - 1) // self.pad_to_multiple_of + 1
             ) * self.pad_to_multiple_of
