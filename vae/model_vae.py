@@ -149,6 +149,13 @@ class VAE(nn.Module):
     def _encoder_embedding_layer(self):
         return self._encoder_model().get_input_embeddings()
 
+    def _encoder_backbone(self):
+        # AutoModelForCausalLM would otherwise materialize vocabulary logits
+        # that the VAE encoder never uses. Calling the transformer backbone
+        # preserves the same hidden states while avoiding that large projection.
+        encoder_model = self._encoder_model()
+        return getattr(encoder_model, "model", encoder_model)
+
     def _decoder_embedding_layer(self):
         return self.decoder.get_input_embeddings()
 
@@ -221,15 +228,17 @@ class VAE(nn.Module):
         )
         embeddings[memory_mask] = memory_embeddings
 
-        outputs = self.icae(
+        outputs = self._encoder_backbone()(
             inputs_embeds=embeddings,
             attention_mask=attention_mask,
             position_ids=self._position_ids(attention_mask),
-            output_hidden_states=True,
+            output_hidden_states=False,
             use_cache=False,
             return_dict=True,
         )
-        hidden = outputs.hidden_states[-1]
+        hidden = getattr(outputs, "last_hidden_state", None)
+        if hidden is None:
+            hidden = outputs.hidden_states[-1]
         memory_hidden = hidden[memory_mask].view(batch_size, self.mem_size, -1)
         return self.mean(memory_hidden), self.log_var(memory_hidden)
 
@@ -317,7 +326,9 @@ class VAE(nn.Module):
             (prompt_answer_ids >= self.vocab_size)
             & (prompt_answer_ids < self.vocab_size + memory_slots.size(1))
         )
-        decompressed = self.decompress_layer(memory_slots.to(self.decompress_layer.weight.dtype))
+        decompressed = self.decompress_layer(
+            memory_slots.to(self.decompress_layer.weight.dtype)
+        )
         prompt_answer_embs[decoder_mem_mask] = decompressed.reshape(
             -1, decompressed.size(-1)
         )
@@ -376,12 +387,12 @@ class VAE(nn.Module):
         logvar = torch.cat(logvars, dim=1)
         if return_sample == "parameters":
             return mean, logvar
-        if return_sample == "sample":
+        if return_sample in (None, "", "sample"):
             return self.reparameterize(mean, logvar)
-        if return_sample in (None, "", "mean"):
+        if return_sample == "mean":
             return mean
         raise ValueError(
-            "return_sample must be one of None, '', 'mean', 'sample', or 'parameters'"
+            "return_sample must be one of None, '', 'sample', 'mean', or 'parameters'"
         )
 
     def _tokenize_batch(self, texts: list[str], max_length: int = 5120) -> torch.Tensor:
@@ -429,7 +440,7 @@ class VAE(nn.Module):
             dtype=self.decompress_layer.weight.dtype,
         )
         # Figure 7 conditions the frozen decoder directly on the sampled
-        # thought tokens.  The first text token is predicted from the final
+        # thought tokens. The first text token is predicted from the final
         # latent position; there is no release-only AE delimiter.
         prefix = self.decompress_layer(memory_slots)
 
@@ -470,7 +481,7 @@ class VAE(nn.Module):
     def run_inference(self, text: str) -> str:
         self.eval()
         with torch.no_grad():
-            memory_slots = self.encode_text(text, return_sample="mean")
+            memory_slots = self.encode_text(text, return_sample="sample")
             return self._greedy_decode(memory_slots)[0]
 
     def decode_text(self, memory_slots: torch.Tensor):
