@@ -149,7 +149,7 @@ def pretrain_tokenize_function(
         decoder_ids = list(mem) + target_ids
         decoder_labels = [-100] * mem_size + target_ids
         if len(decoder_ids) > model_max_length:
-            raise AssertionError("decoder sequence exceeded model_max_length")
+            raise ValueError("decoder sequence exceeded model_max_length")
         prompt_answer_ids.append(decoder_ids)
         labels.append(decoder_labels)
 
