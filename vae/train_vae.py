@@ -1,260 +1,171 @@
-import transformers
-import torch
+"""Train the LaDiR variational autoencoder with the paper recipe."""
+
+from __future__ import annotations
+
 from dataclasses import dataclass, field
 from typing import Optional
-from peft import (
-    LoraConfig,
-)
-import argparse
-import json
 
-from training_utils import pretrain_tokenize_function, DataCollatorForDynamicPadding, train_model
+import transformers
+from peft import LoraConfig
+from transformers import HfArgumentParser
+
+from data_vae import ANSWER_PREFIX, load_data
 from model_vae import VAE
+from training_utils import (
+    DataCollatorForDynamicPadding,
+    pretrain_tokenize_function,
+    train_model,
+)
 
-from data_vae import load_data
-import os
-import warnings
-warnings.filterwarnings("ignore")
 
 @dataclass
 class ModelArguments:
-    model_name_or_path: str = field(default="meta-llama/Llama-3.2-1B-Instruct")
-    lora_r: int = field(
-        default=128,
-        metadata={"help": "lora rank"}
-    )
-    lora_alpha: int = field(
-        default=32,
-        metadata={"help": "lora alpha"}
-    )
-    lora_dropout: float = field(
-        default=0.05,
-        metadata={"help": "lora dropout"}
-    )
-    train: bool = field(
-        default=True,
-        metadata={"help": "if true, the model ckpt will be initialized for training; else, it's for inference"}
-    )
-    beta: float = field(
-        default=1e-5,
-        metadata={"help": "Beta for VAE's KL loss"}
-    )
+    model_name_or_path: str = field(default="meta-llama/Llama-3.1-8B")
+    train: bool = field(default=True)
+    beta: float = field(default=1e-5)
+    latent_dim: int = field(default=512)
+    latent_noise_std: float = field(default=3.0)
+    token_substitution_prob: float = field(default=0.3)
+    paper_block_mode: bool = field(default=True)
+
+    # Compatibility path only.  The paper fine-tunes every encoder parameter.
+    use_lora: bool = field(default=False)
+    lora_r: int = field(default=512)
+    lora_alpha: int = field(default=256)
+    lora_dropout: float = field(default=0.05)
+
+
+@dataclass
+class DataArguments:
+    train_file: str = field(default="data/vae_train.jsonl")
+    val_file: Optional[str] = field(default="data/vae_val.jsonl")
+    input_type: str = field(default="cot_only")
+    test_size: int = field(default=100)
+    answer_prefix: str = field(default=ANSWER_PREFIX)
+    require_answer_prefix: bool = field(default=True)
+    preprocessing_num_workers: int = field(default=16)
+    preprocessing_batch_size: int = field(default=256)
+
 
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
+    output_dir: str = field(default="checkpoints/vae_paper")
     cache_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
-    model_max_length: int = field(
-        default=28000,
-        metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
-    )
-    fixed_mem_size: int = field(
-        default=3,
-        metadata={"help": "Enabling the fixed mem size."},
-    )
-    ignore_data_skip: bool = field(
-        default=True,
-        metadata={"help": "Enabling the fixed mem size."},
-    )
-    mean_compression_rate: int = field(
-        default=128*4,
-        metadata={"help": "Mean compression rate; default=4"},
-    )
-    min_tokens_for_lm: int = field(
-        default=64,
-        metadata={"help": "Minimum tokens for lm objective learning"},
-    )
-    leave_tokens_for_lm: int = field(
-        default=8,
-        metadata={"help": "Leave some tokens without loss for lm objective"},
-    )
-    lm_ratio: float = field(
-        default=0.0,
-        metadata={"help": "Ratio for LM training."},
-    )
-    add_special_token_for_lm: bool = field(
-        default=False,
-        metadata={"help": "Add a special token for the prompt of language modeling; default: False"},
-    )
-    restore_from: str = field(
-        default="",
-        metadata={"help": "The checkpoint that should be restored from for fine-tuning"}
-    )
-    per_device_train_batch_size: int = field(
-        default=8,
-        metadata={"help": "The batch size per GPU/XPU/TPU/MPS/NPU core/CPU for training."}
-    )
-    per_device_eval_batch_size: int = field(
-        default=4,
-        metadata={"help": "The batch size per GPU/XPU/TPU/MPS/NPU core/CPU for evaluation."}
-    )
-    report_to: str = field(
-        default="wandb"
-    )
-    max_steps: int = field(
-        default=15000
-    )
-    save_strategy: str = field(
-        default="steps"
-    )
-    save_steps: int = field(
-        default=2500
-    )
-    logging_strategy: str = field(
-        default="steps"
-    )
-    logging_steps: int = field(
-        default=1
-    )
-    learning_rate: float = field(
-        default=2.5e-5
-    )
-    lr_scheduler_type: str = field(
-        default="cosine"
-    )
-    lr_scheduler_kwargs: dict = field(default_factory=dict)
-    warmup_steps: int = field(
-        default=0
-    )
-    weight_decay: float = field(
-        default=0.0
-    )
-    eval_strategy: str = field(
-        default="no"
-    )
-    num_train_epochs: int = field(
-        default=1
-    )
-    bf16: bool = field(
-        default=True
+    model_max_length: int = field(default=512)
+    fixed_mem_size: int = field(default=4)
+    mean_compression_rate: int = field(default=1)
+    restore_from: str = field(default="")
+
+    # Kept for backward-compatible tokenization signatures; unused by the
+    # paper's pure autoencoding objective.
+    min_tokens_for_lm: int = field(default=64)
+    leave_tokens_for_lm: int = field(default=8)
+    lm_ratio: float = field(default=0.0)
+    add_special_token_for_lm: bool = field(default=False)
+
+    per_device_train_batch_size: int = field(default=16)
+    per_device_eval_batch_size: int = field(default=1)
+    gradient_accumulation_steps: int = field(default=1)
+    num_train_epochs: float = field(default=2.0)
+    max_steps: int = field(default=-1)
+    learning_rate: float = field(default=2e-5)
+    lr_scheduler_type: str = field(default="cosine")
+    warmup_steps: int = field(default=1000)
+    weight_decay: float = field(default=0.03)
+    max_grad_norm: float = field(default=1.0)
+    bf16: bool = field(default=True)
+    save_strategy: str = field(default="epoch")
+    logging_steps: float = field(default=10)
+    eval_strategy: str = field(default="no")
+    remove_unused_columns: bool = field(default=False)
+    dataloader_num_workers: int = field(default=8)
+    report_to: str = field(default="wandb")
+    ignore_data_skip: bool = field(default=True)
+
+
+def main(
+    model_args: ModelArguments,
+    data_args: DataArguments,
+    training_args: TrainingArguments,
+) -> None:
+    train_dataset, eval_dataset, inference_examples = load_data(
+        test_size=data_args.test_size,
+        input_type=data_args.input_type,
+        train_file=data_args.train_file,
+        val_file=data_args.val_file,
+        answer_prefix=data_args.answer_prefix,
+        require_answer_prefix=data_args.require_answer_prefix,
     )
 
-def main(model_args, training_args, args, notes):    
+    lora_config = None
+    if model_args.use_lora:
+        lora_config = LoraConfig(
+            r=model_args.lora_r,
+            lora_alpha=model_args.lora_alpha,
+            lora_dropout=model_args.lora_dropout,
+            bias="none",
+            task_type="CAUSAL_LM",
+        )
 
-    train_dataset, eval_dataset, lines = load_data(args.test_size, args.input_type)
-    
-    lora_config = LoraConfig(
-        r=model_args.lora_r,
-        lora_alpha=model_args.lora_alpha,
-        lora_dropout=model_args.lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM"
+    print("Loading VAE encoder and frozen decoder...")
+    model = VAE(model_args, training_args, lora_config)
+    memory_ids = list(
+        range(model.vocab_size, model.vocab_size + model.mem_size)
     )
 
-    print("Loading model...")
-    model = VAE(model_args, training_args, lora_config).to("cuda")
-    model = model.to(torch.bfloat16)
-
-    print("Model loaded successfully...")
-    
-    memory_size = training_args.fixed_mem_size
-    MEM_TOKENS = list(range(model.vocab_size, model.vocab_size + memory_size))
-
-    print("Tokenizing train/eval datasets...")
-
-    train_fn_kwargs = {
-        "tokenizer": model.tokenizer, 
-        "model_max_length": model.training_args.model_max_length,
+    tokenize_kwargs = {
+        "tokenizer": model.tokenizer,
+        "model_max_length": training_args.model_max_length,
         "mem_size": model.mem_size,
-        "min_tokens_for_lm": model.training_args.min_tokens_for_lm,
+        "min_tokens_for_lm": training_args.min_tokens_for_lm,
         "mean_compression_rate": model.mean_compression_rate,
-        "add_special_token_for_lm": model.training_args.add_special_token_for_lm,
-        "leave_tokens_for_lm": model.training_args.leave_tokens_for_lm,
+        "add_special_token_for_lm": training_args.add_special_token_for_lm,
+        "leave_tokens_for_lm": training_args.leave_tokens_for_lm,
         "ae_token_id": model.ae_token_id,
         "eos_id": model.eos_id,
-        #"lm_token_id": model.lm_token_id,
-        "mem": MEM_TOKENS, 
-        "input_type": args.input_type, 
-        "lm_ratio": training_args.lm_ratio
+        "mem": memory_ids,
+        "input_type": data_args.input_type,
+        "lm_ratio": training_args.lm_ratio,
     }
 
-    eval_fn_kwargs = {
-        "tokenizer": model.tokenizer, 
-        "model_max_length": model.training_args.model_max_length,
-        "mem_size": model.mem_size,
-        "min_tokens_for_lm": model.training_args.min_tokens_for_lm,
-        "mean_compression_rate": model.mean_compression_rate,
-        "add_special_token_for_lm": model.training_args.add_special_token_for_lm,
-        "leave_tokens_for_lm": model.training_args.leave_tokens_for_lm,
-        "ae_token_id": model.ae_token_id,
-        "eos_id": model.eos_id,
-        #"lm_token_id": model.lm_token_id,
-        "mem": MEM_TOKENS, 
-        "input_type": args.input_type, 
+    map_kwargs = {
+        "function": pretrain_tokenize_function,
+        "batched": True,
+        "batch_size": data_args.preprocessing_batch_size,
+        "fn_kwargs": tokenize_kwargs,
+        "remove_columns": train_dataset.column_names,
     }
-    
-    train_dataset = train_dataset.map(pretrain_tokenize_function, batched=True, num_proc=112, batch_size=64, fn_kwargs=train_fn_kwargs)
-    eval_dataset = eval_dataset.map(pretrain_tokenize_function, batched=True, num_proc=112, batch_size=64, fn_kwargs=eval_fn_kwargs)
-    print("Finished tokenizing train/eval datasets...")
+    if data_args.preprocessing_num_workers > 1:
+        map_kwargs["num_proc"] = data_args.preprocessing_num_workers
+
+    print("Tokenizing train blocks...")
+    tokenized_train = train_dataset.map(**map_kwargs)
+    print("Tokenizing eval blocks...")
+    eval_map_kwargs = dict(map_kwargs)
+    eval_map_kwargs["remove_columns"] = eval_dataset.column_names
+    tokenized_eval = eval_dataset.map(**eval_map_kwargs)
 
     data_collator = DataCollatorForDynamicPadding(model.pad_token_id)
-
-    print("Training model...")
     train_model(
-        args,
-        notes,
-        model, 
-        train_dataset, 
-        eval_dataset, 
+        data_args,
+        None,
+        model,
+        tokenized_train,
+        tokenized_eval,
         model_args,
-        training_args, 
-        lines,
+        training_args,
+        inference_examples,
         data_collator,
     )
-    print("Finished training...")
+
 
 def parse_args():
-    """Parses command-line arguments and initializes Model & Training arguments dynamically."""
-    parser = argparse.ArgumentParser(description="Fine-tune a LLaMA model with LoRA.")
-
-    # Add arguments dynamically
-    parser.add_argument("--model_name_or_path", type=str, required=True, help="Pretrained model path.")
-    parser.add_argument("--lora_r", type=int, default=128, help="LoRA rank.")
-    parser.add_argument("--lora_alpha", type=int, default=32, help="LoRA scaling factor.")
-    parser.add_argument("--lora_dropout", type=float, default=0.05, help="LoRA dropout rate.")
-
-    # Training Arguments (Automatically Converted to `TrainingArguments`)
-    parser.add_argument("--output_dir", type=str, required=True, help="Directory to save checkpoints and logs.")
-    parser.add_argument("--input_type", type=str, required=True, help="Can be 'cot_only', 'full_format', or 'q_q_only'.")
-    parser.add_argument("--test_size", type=int, default=0.1, help="Test dataset split ratio.")
-    parser.add_argument("--max_steps", type=int, default=5000, help="Maximum training steps.")
-    parser.add_argument("--num_train_epochs", type=int, default=10, help="Number of training epochs.")
-    parser.add_argument("--learning_rate", type=float, default=2.5e-5, help="Learning rate.")
-    parser.add_argument("--lr_scheduler_type", type=str, default="cosine", help="LR scheduler type.")
-    parser.add_argument("--lr_scheduler_kwargs", type=str, default="{}", help="JSON string of LR scheduler kwargs.")
-    parser.add_argument("--warmup_steps", type=int, default=0, help="Warmup steps.")
-    parser.add_argument("--optim", type=str, default="adamw_torch", help="Optimizer type.")
-    parser.add_argument("--weight_decay", type=float, default=0.0, help="Weight decay coefficient.")
-    parser.add_argument("--eval_strategy", type=str, default="epoch", help="Evaluation strategy.")
-    parser.add_argument("--save_strategy", type=str, default="steps", help="Save strategy.")
-    parser.add_argument("--save_steps", type=int, default=5000, help="Saving steps.")
-    parser.add_argument("--notes", type=str, help="Additional notes for the run.")
-    parser.add_argument("--eval_interval", type=int, default=1000, help="evaluation interval")
-    parser.add_argument("--run_name", type=str, help="Name of the run.")
-    parser.add_argument("--ddp_backend", type=str, default="nccl", help="Distributed Data Parallel backend.")
-    parser.add_argument("--fsdp", type=str, default="hybrid_shard auto_wrap", help="FSDP mode/configuration.")
-    parser.add_argument("--beta", type=float, default=1e-5, help="Beta value for KL loss")
-
-    parser.add_argument(
-        "--fsdp_config",
-        type=str,
-        default='{"backward_prefetch": "backward_pre", "forward_prefetch": true, "cpu_ram_efficient_loading": true, "sync_module_states": true, "transformer_layer_cls_to_wrap": ["LlamaDecoderLayer"], "use_orig_params": true, "activation_checkpointing": true}',
-        help="FSDP configuration in JSON format."
+    parser = HfArgumentParser(
+        (ModelArguments, DataArguments, TrainingArguments)
     )
+    return parser.parse_args_into_dataclasses()
 
-    args = parser.parse_args()
 
-    # Convert JSON string arguments
-    args.lr_scheduler_kwargs = json.loads(args.lr_scheduler_kwargs)
-    args.fsdp_config = json.loads(args.fsdp_config)
-
-    skip_list = ['input_type', 'test_size', 'notes', 'eval_interval']
-    
-    model_args = ModelArguments(**{k: v for k, v in vars(args).items() if k in ModelArguments.__annotations__})
-    training_args = TrainingArguments(**{k: v for k, v in vars(args).items() if k not in ModelArguments.__annotations__ and k not in skip_list})
-
-    return model_args, training_args, args
-    
 if __name__ == "__main__":
-    model_args, training_args, args = parse_args()
-    main(model_args, training_args, args, args.notes)
+    main(*parse_args())
