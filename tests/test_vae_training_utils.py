@@ -15,14 +15,14 @@ import torch
 wandb_stub = types.ModuleType("wandb")
 wandb_stub.run = None
 wandb_stub.log = lambda *args, **kwargs: None
-sys.modules.setdefault("wandb", wandb_stub)
+sys.modules["wandb"] = wandb_stub
 
 transformers_stub = types.ModuleType("transformers")
 transformers_stub.Trainer = object
 trainer_utils_stub = types.ModuleType("transformers.trainer_utils")
 trainer_utils_stub.get_last_checkpoint = lambda _: None
-sys.modules.setdefault("transformers", transformers_stub)
-sys.modules.setdefault("transformers.trainer_utils", trainer_utils_stub)
+sys.modules["transformers"] = transformers_stub
+sys.modules["transformers.trainer_utils"] = trainer_utils_stub
 
 MODULE_PATH = Path(__file__).parents[1] / "vae" / "training_utils.py"
 spec = importlib.util.spec_from_file_location("training_utils", MODULE_PATH)
@@ -84,7 +84,7 @@ class VAETeacherForcingTest(unittest.TestCase):
         )
         self.assertNotIn(999, result["prompt_answer_ids"][0])
 
-    def test_decoder_sequence_respects_model_max_length(self):
+    def test_encoder_and_decoder_respect_model_max_length(self):
         result = tokenize(
             examples={
                 "cot_only": ["a b c d e f g h"],
@@ -93,6 +93,7 @@ class VAETeacherForcingTest(unittest.TestCase):
             model_max_length=7,
         )
         decoder_ids = result["prompt_answer_ids"][0]
+        self.assertEqual(len(result["input_ids"][0]), 3)
         self.assertEqual(len(decoder_ids), 7)
         self.assertEqual(decoder_ids[-1], 2)
 
