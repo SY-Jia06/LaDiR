@@ -9,7 +9,7 @@ replace the repository with a new VAE architecture.
 | Item | Paper recipe | Released code | Reproduction change |
 |---|---|---|---|
 | Training unit | One CoT sentence per block | Whole question/solution with length-driven segmentation | Split on `The answer is`, then sentence-blockize before tokenization |
-| Encoder | Pretrained LLM, all parameters fine-tuned | LoRA-only encoder | Full fine-tuning by default; LoRA retained only as an opt-in compatibility path |
+| Encoder | Pretrained LLM, all parameters fine-tuned | LoRA-only encoder | Full fine-tuning by default; LoRA retained only as an opt-in optimization |
 | Decoder | Separate frozen pretrained LLM | Separate decoder in training, encoder-with-disabled-adapter in inference | Always use the same separate frozen decoder |
 | Latent size | 512 dimensions | 128 dimensions | Default changed to 512 |
 | Block size | 4 latent tokens in Table 13 and Table 7 | 3 memory tokens | Default changed to 4 |
@@ -19,6 +19,31 @@ replace the repository with a new VAE architecture.
 | Training recipe | LR `2e-5`, batch 128, 2 epochs, beta `1e-5` | LR/epochs/batch differed across script/config/defaults | Align launcher, Python defaults, and YAML |
 | Token IDs | Backbone tokenizer IDs | Hard-coded BOS/EOS IDs from older LLaMA versions | Read special IDs from the tokenizer |
 | Padding | Padding-aware batched encoding and decoding | No attention masks | Add masks and consistent position IDs |
+| Decoder context | Latent prefix and target must fit the model context | Target truncated before adding memory tokens and EOS | Reserve the memory prefix inside `model_max_length` and force EOS within budget |
+| Backbone interface | Paper uses Llama-3.1-8B | Generic `AutoModelForCausalLM` path implied broader support | Validate Llama model type and use its transformer backbone explicitly |
+
+## Deliberately unsupported release path
+
+The release's length-driven multi-segment encoder reused one set of memory-token
+IDs while producing multiple latent groups. That layout cannot satisfy the
+paper decoder interface, which expects one fixed latent block before the target
+sentence. The reproduction therefore fails fast when `paper_block_mode=False`
+instead of advertising a compatibility mode that breaks at decoder masking.
+
+## Sentence blockization
+
+The paper defines one sentence as one VAE block but does not publish its exact
+sentence-segmentation implementation. The repository uses a deterministic
+heuristic based on newlines and terminal punctuation. It protects decimals,
+common abbreviations such as `e.g.` and `Eq.`, and initialisms such as `U.S.`.
+It can still require upstream normalization for domain-specific abbreviations or
+punctuation without whitespace.
+
+Before full training, inspect the real data with:
+
+```bash
+python scripts/audit_vae_blocks.py --input data/vae_train.jsonl --show 20
+```
 
 ## Paper inconsistency retained as an explicit choice
 
@@ -44,6 +69,7 @@ those secondary values explicit rather than presenting them as paper claims.
 
 The patch covers the VAE data, model, teacher-forcing objective, inference
 path, dependencies, and launcher. Static compilation, shell validation,
-preprocessing tests, teacher-forcing tests, and a tiny mocked model smoke test
-pass. It does not claim the published benchmark numbers until the full 8B
-multi-GPU training run has completed on the paper data.
+preprocessing tests, teacher-forcing tests, context-budget tests, padding tests,
+and a mocked model-interface smoke test pass. It does not claim the published
+benchmark numbers until the full 8B multi-GPU training run has completed on the
+paper data.
