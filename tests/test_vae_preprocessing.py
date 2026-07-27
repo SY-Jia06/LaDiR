@@ -13,7 +13,7 @@ import unittest
 # symbol here so the pure split functions can be tested in lightweight CI.
 datasets_stub = types.ModuleType("datasets")
 datasets_stub.Dataset = object
-sys.modules.setdefault("datasets", datasets_stub)
+sys.modules["datasets"] = datasets_stub
 
 MODULE_PATH = Path(__file__).parents[1] / "vae" / "data_vae.py"
 spec = importlib.util.spec_from_file_location("data_vae", MODULE_PATH)
