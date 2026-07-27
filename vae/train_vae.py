@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-import json
 import os
 import sys
 from typing import Optional
@@ -119,6 +118,10 @@ class TrainingArguments(transformers.TrainingArguments):
     remove_unused_columns: bool = True
     report_to: str = "wandb"
     ddp_find_unused_parameters: bool = False
+    resume_from_checkpoint: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional Trainer checkpoint directory."},
+    )
 
 
 def parse_args():
@@ -188,12 +191,14 @@ def main() -> None:
         processing_class=model.tokenizer,
     )
 
-    checkpoint = training_args.resume_from_checkpoint
-    train_result = trainer.train(resume_from_checkpoint=checkpoint)
-    trainer.save_model()
-    trainer.save_state()
-    trainer.log_metrics("train", train_result.metrics)
-    trainer.save_metrics("train", train_result.metrics)
+    if training_args.do_train:
+        train_result = trainer.train(
+            resume_from_checkpoint=training_args.resume_from_checkpoint
+        )
+        trainer.save_model()
+        trainer.save_state()
+        trainer.log_metrics("train", train_result.metrics)
+        trainer.save_metrics("train", train_result.metrics)
 
     if training_args.do_eval:
         metrics = trainer.evaluate()
