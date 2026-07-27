@@ -1,498 +1,485 @@
-"""
-VAE that supports multi span concat
+"""Paper-aligned variational autoencoder for LaDiR thought blocks.
+
+The implementation retains the repository's ICAE-style design: a pretrained
+causal LLM encodes a text block followed by learnable memory tokens, linear
+heads parameterize a Gaussian latent distribution, and a separate frozen copy
+of the pretrained LLM reconstructs the text under teacher forcing.
 """
 
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from __future__ import annotations
+
+import math
+from typing import Optional
+
 import torch
 import torch.nn as nn
-from typing import Optional
 from peft import get_peft_model
-import math
 from safetensors.torch import load_file
+from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    
-def print_trainable_parameters(model):
+
+def print_trainable_parameters(model: nn.Module) -> None:
     trainable_parameters = 0
-    all_param = 0
-    for _, param in model.named_parameters():
-        all_param += param.numel()
-        if param.requires_grad:
-            trainable_parameters += param.numel()
-    print(f"trainable params: {trainable_parameters} || all params: {all_param} || trainable%: {100 * trainable_parameters / all_param}")
+    all_parameters = 0
+    for parameter in model.parameters():
+        all_parameters += parameter.numel()
+        if parameter.requires_grad:
+            trainable_parameters += parameter.numel()
+    percentage = 100 * trainable_parameters / max(all_parameters, 1)
+    print(
+        f"trainable params: {trainable_parameters} || all params: {all_parameters} "
+        f"|| trainable%: {percentage}"
+    )
 
 
-def freeze_model(model):
-    for _, param in model.named_parameters():
-        param.requires_grad = False
+def freeze_model(model: nn.Module) -> None:
+    for parameter in model.parameters():
+        parameter.requires_grad = False
 
 
-class VAE(torch.nn.Module):
+class VAE(nn.Module):
+    """Variational autoencoder for one-sentence LaDiR thought blocks.
+
+    Paper-aligned defaults are supplied by ``train_vae.py``:
+
+    * full-parameter encoder fine-tuning;
+    * four learnable latent tokens per sentence block;
+    * latent dimension 512;
+    * latent Gaussian augmentation with standard deviation 3;
+    * encoder token substitution probability 0.3;
+    * a separate frozen pretrained decoder.
+
+    LoRA and legacy multi-segment compression remain available as explicit
+    compatibility options, but are disabled by the reproduction recipe.
     """
-    Variational Autoencoder for text compression and reconstruction.
-    
-    This VAE model:
-    - Compresses text sequences into latent representations
-    - Supports multi-segment processing for long sequences
-    - Uses LoRA for parameter-efficient fine-tuning
-    - Includes KL divergence regularization
-    
-    Args:
-        model_args: Model configuration arguments
-        training_args: Training configuration arguments  
-        lora_config: LoRA configuration for fine-tuning
-    """
-    
-    def __init__(self, model_args, training_args, lora_config):
+
+    def __init__(self, model_args, training_args, lora_config=None):
         super().__init__()
         self.model_args = model_args
         self.training_args = training_args
         self.model_name = model_args.model_name_or_path
-        self.icae = AutoModelForCausalLM.from_pretrained(self.model_name, torch_dtype=torch.bfloat16)
-        
-        self.training = self.model_args.train    
-        
-        if self.training:    # independent model for gradient checkpointing
-            self.decoder = AutoModelForCausalLM.from_pretrained(self.model_name, torch_dtype=torch.bfloat16)
+        self.is_trainable_model = bool(getattr(model_args, "train", True))
 
-        self.vocab_size = self.icae.config.vocab_size + 1    # [PAD] token
-        self.pad_token_id = self.vocab_size - 1
-        self.mean_compression_rate = training_args.mean_compression_rate
-
-        self.dim = 128
-
-        self.beta = model_args.beta
-
-        self.mean = nn.Linear(in_features=self.icae.config.hidden_size, out_features=self.dim, dtype=torch.bfloat16)
-        self.log_var = nn.Linear(in_features=self.icae.config.hidden_size, out_features=self.dim, dtype=torch.bfloat16)
-
-        self.decompress_layer = nn.Linear(in_features=self.dim, out_features=self.icae.config.hidden_size, dtype=torch.bfloat16)
-        
-        # tunable
-        self.mem_size = self.training_args.fixed_mem_size
-        self.vocab_size_with_mem = self.vocab_size + self.mem_size # so, the mem tokens are in the range [self.vocab_size, self.vocab_size + self.mem_size)
-
-        # special tokens in addition to mem and length tokens
-        self.ae_token_id = self.vocab_size_with_mem + 0       
-
-        self.icae.resize_token_embeddings(self.vocab_size_with_mem + 1) 
-        
-        # special tokens for Llama-2/Mistral tokenizer
-        self.bos_id = 1
-        self.eos_id = 2
-        
-        #self.dim = self.icae.config.hidden_size
-        self.icae = get_peft_model(self.icae, lora_config)
-        
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-        self.memory_token_embed = nn.Embedding(self.mem_size + 1, self.dim, padding_idx=None)
-        #self.ae_token_embed = nn.Embedding(1, self.dim, padding_idx=None)
-
-        self.loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
         self.tokenizer = AutoTokenizer.from_pretrained(self.model_name, use_fast=False)
-        self.append_sequence = torch.arange(self.vocab_size, self.vocab_size + self.mem_size, dtype=torch.long, device=self.device).unsqueeze(0)   # mem tokens
-        
-        if self.training:
-            self.init()
+        self.icae = AutoModelForCausalLM.from_pretrained(
+            self.model_name,
+            torch_dtype=torch.bfloat16,
+        )
+        # The paper uses an independent frozen pretrained LLM as the decoder.
+        self.decoder = AutoModelForCausalLM.from_pretrained(
+            self.model_name,
+            torch_dtype=torch.bfloat16,
+        )
 
-    def encoder_mean(self, input_ids_enc, *kargs):
-        hidden_state = self.encoder(input_ids_enc, *kargs)
-        shapes = hidden_state.shape
-        mean = self.fc_mean(hidden_state).view(-1, shapes[2], shapes[1])
-        if self.h_tanh:
-            mean = torch.tanh(mean)
-        return mean
+        self.base_vocab_size = self.icae.config.vocab_size
+        self.vocab_size = self.base_vocab_size + 1  # reserve one ID for padding
+        self.pad_token_id = self.base_vocab_size
+        self.bos_id = self.tokenizer.bos_token_id
+        self.eos_id = self.tokenizer.eos_token_id
+        if self.eos_id is None:
+            raise ValueError("The selected tokenizer must define eos_token_id.")
 
-    def init(self):
-        print("Freezing the decoder...")
-        if self.training:
-            freeze_model(self.decoder)
-            self.decoder.eval()
-            #self.decoder.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+        self.mem_size = int(training_args.fixed_mem_size)
+        self.mean_compression_rate = int(training_args.mean_compression_rate)
+        self.paper_block_mode = bool(getattr(model_args, "paper_block_mode", True))
+        self.dim = int(getattr(model_args, "latent_dim", 512))
+        self.beta = float(model_args.beta)
+        self.latent_noise_std = float(getattr(model_args, "latent_noise_std", 3.0))
+        self.token_substitution_prob = float(
+            getattr(model_args, "token_substitution_prob", 0.3)
+        )
+        self.use_lora = bool(getattr(model_args, "use_lora", False))
 
+        self.vocab_size_with_mem = self.vocab_size + self.mem_size
+        self.ae_token_id = self.vocab_size_with_mem
+        self.icae.resize_token_embeddings(self.vocab_size_with_mem + 1)
+
+        if self.use_lora:
+            if lora_config is None:
+                raise ValueError("lora_config is required when use_lora=True")
+            self.icae = get_peft_model(self.icae, lora_config)
+
+        hidden_size = self.icae.config.hidden_size
+        self.mean = nn.Linear(hidden_size, self.dim, dtype=torch.bfloat16)
+        self.log_var = nn.Linear(hidden_size, self.dim, dtype=torch.bfloat16)
+        self.decompress_layer = nn.Linear(self.dim, hidden_size, dtype=torch.bfloat16)
+        self.memory_token_embed = nn.Embedding(
+            self.mem_size + 1,
+            self.dim,
+            padding_idx=None,
+            dtype=torch.bfloat16,
+        )
+        self.loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+
+        self.register_buffer(
+            "append_sequence",
+            torch.arange(self.vocab_size, self.vocab_size + self.mem_size).unsqueeze(0),
+            persistent=False,
+        )
+
+        freeze_model(self.decoder)
+        self.decoder.eval()
+        self._restore_if_requested()
         print_trainable_parameters(self)
-        if self.training_args.restore_from is not None and self.training_args.restore_from != "":
-            print(f"Loading from the pretrained checkpoint: {self.training_args.restore_from}...")
-            state_dict = load_file(self.training_args.restore_from)
-            self.load_state_dict(state_dict)
-            print(f"Finished loading from {self.training_args.restore_from}")
-        #print("Enabling gradient checkpointing...")
-        # self.icae.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-                
-        
-    def compute_num_segments(self, total_length):
-        assert total_length > 0
-        num_segments = math.ceil(total_length / (self.mem_size * self.mean_compression_rate))  # 128 * 4 -> 1 * (128*4)
-        return num_segments
 
-    def reparameterize(self, mu, logvar):
+    @property
+    def device(self) -> torch.device:
+        return next(self.parameters()).device
+
+    def train(self, mode: bool = True):
+        """Keep the frozen decoder deterministic while the encoder is trained."""
+        super().train(mode)
+        self.decoder.eval()
+        return self
+
+    def _restore_if_requested(self) -> None:
+        restore_from = getattr(self.training_args, "restore_from", "")
+        if not restore_from:
+            return
+        print(f"Loading from the pretrained checkpoint: {restore_from}...")
+        state_dict = load_file(restore_from)
+        self.load_state_dict(state_dict)
+        print(f"Finished loading from {restore_from}")
+
+    def _encoder_model(self):
+        if self.use_lora:
+            return self.icae.get_base_model()
+        return self.icae
+
+    def _encoder_embedding_layer(self):
+        return self._encoder_model().get_input_embeddings()
+
+    def _decoder_embedding_layer(self):
+        return self.decoder.get_input_embeddings()
+
+    @staticmethod
+    def _position_ids(attention_mask: torch.Tensor) -> torch.Tensor:
+        position_ids = attention_mask.long().cumsum(dim=-1) - 1
+        return position_ids.clamp_min_(0)
+
+    def _decoder_text_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Embed ordinary decoder tokens without indexing custom VAE token IDs."""
+        safe_ids = token_ids.clone()
+        custom_or_pad = safe_ids >= self.base_vocab_size
+        safe_ids[custom_or_pad] = 0
+        embeddings = self._decoder_embedding_layer()(safe_ids)
+        embeddings[token_ids == self.pad_token_id] = 0
+        return embeddings
+
+    def _apply_token_substitution(self, input_ids: torch.Tensor) -> torch.Tensor:
+        if not self.training or self.token_substitution_prob <= 0:
+            return input_ids
+        valid = (input_ids >= 0) & (input_ids < self.base_vocab_size)
+        replace = (
+            torch.rand(input_ids.shape, device=input_ids.device)
+            < self.token_substitution_prob
+        ) & valid
+        random_ids = torch.randint(
+            low=0,
+            high=self.base_vocab_size,
+            size=input_ids.shape,
+            device=input_ids.device,
+            dtype=input_ids.dtype,
+        )
+        return torch.where(replace, random_ids, input_ids)
+
+    def compute_num_segments(self, total_length: int) -> int:
+        if total_length <= 0:
+            raise ValueError("total_length must be positive")
+        # LaDiR blockizes the dataset before VAE encoding: one sentence is one
+        # fixed-size latent block. The old length-driven segmentation remains an
+        # opt-in compatibility path only.
+        if self.paper_block_mode:
+            return 1
+        denominator = self.mem_size * self.mean_compression_rate
+        if denominator <= 0:
+            raise ValueError("mem_size * mean_compression_rate must be positive")
+        return math.ceil(total_length / denominator)
+
+    @staticmethod
+    def reparameterize(mu: torch.Tensor, logvar: torch.Tensor) -> torch.Tensor:
         std = torch.exp(0.5 * logvar)
-        eps = torch.randn_like(std)
-        return mu + eps * std
+        return mu + torch.randn_like(std) * std
+
+    def _encode_segment(
+        self,
+        segment_input_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size = segment_input_ids.size(0)
+        memory_ids = self.append_sequence.to(segment_input_ids.device).expand(
+            batch_size, -1
+        )
+        encoder_ids = torch.cat([segment_input_ids, memory_ids], dim=1)
+        memory_mask = encoder_ids >= self.vocab_size
+        attention_mask = encoder_ids.ne(self.pad_token_id)
+
+        embeddings = self._encoder_embedding_layer()(encoder_ids)
+        memory_embeddings = self.decompress_layer(
+            self.memory_token_embed(
+                encoder_ids[memory_mask] - self.vocab_size
+            ).to(embeddings.dtype)
+        )
+        embeddings[memory_mask] = memory_embeddings
+
+        outputs = self.icae(
+            inputs_embeds=embeddings,
+            attention_mask=attention_mask,
+            position_ids=self._position_ids(attention_mask),
+            output_hidden_states=True,
+            use_cache=False,
+            return_dict=True,
+        )
+        hidden = outputs.hidden_states[-1]
+        memory_hidden = hidden[memory_mask].view(batch_size, self.mem_size, -1)
+        return self.mean(memory_hidden), self.log_var(memory_hidden)
 
     def forward(
         self,
-        input_ids: torch.LongTensor = None,
-        prompt_answer_ids: torch.LongTensor = None,
+        input_ids: torch.LongTensor,
+        prompt_answer_ids: torch.LongTensor,
         labels: Optional[torch.LongTensor] = None,
     ):
-        # encoder part
-        #print("input_ids shape: ", input_ids.size())
-        #print("prompt_answer_ids shape: ", prompt_answer_ids.size())
-        #print("labels shape: ", labels.size())
-        
-        batch_size = input_ids.size(0)
-        total_length = input_ids.size(1)
+        if labels is None:
+            raise ValueError("labels are required for VAE training")
+
+        input_ids = self._apply_token_substitution(input_ids)
+        batch_size, total_length = input_ids.shape
         prompt_answer_ids = prompt_answer_ids.reshape(batch_size, -1)
         num_segments = self.compute_num_segments(total_length)
         segment_length = math.ceil(total_length / num_segments)
 
-        prompt_answer_embs = self.icae.get_base_model().model.embed_tokens(prompt_answer_ids)
-
-        max_compressed_length = num_segments * self.mem_size
-        #print("max_compressed_length: ", max_compressed_length)
-        
-        compress_outputs = torch.zeros((batch_size, max_compressed_length, self.dim)).to(prompt_answer_embs)
-        #print("compress_outputs shape: ", compress_outputs.size())
-        
-        total_kl_loss = torch.zeros(1).to(prompt_answer_embs)
-
+        latent_blocks = []
+        kl_terms = []
         for segment_idx in range(num_segments):
-           # print(f"===============Segment {segment_idx}=======================")
-            
             start_idx = segment_idx * segment_length
             end_idx = min((segment_idx + 1) * segment_length, total_length)
-            #print(f"start_idx: {start_idx} | end_idx: {end_idx}")
-            segment_input_ids = input_ids[:, start_idx:end_idx]
-
-            segment_input_ids = torch.cat([segment_input_ids, self.append_sequence.repeat(batch_size, 1)], dim=1)
-            #print("segment_input_ids shape after concat: ", segment_input_ids.size())
-            mem_flag = segment_input_ids >= self.vocab_size
-            #print("mem_flag shape: ", mem_flag.size())
-
-            segment_input_embedding = self.icae.get_base_model().model.embed_tokens(segment_input_ids)
-            #print("segment_input_embedding shape: ", segment_input_embedding.size())
-            segment_input_embedding[mem_flag] = self.decompress_layer(self.memory_token_embed(segment_input_ids[mem_flag] - self.vocab_size).to(segment_input_embedding))
-            #print("Populated segment_input_embedding memory tokens")
-            
-            # compress the current segment
-            segment_compress_outputs = self.icae(inputs_embeds=segment_input_embedding, output_hidden_states=True)
-            segment_compress_outputs = segment_compress_outputs.hidden_states[-1]
-            batch_memory_tokens = segment_compress_outputs[mem_flag].view(batch_size, self.mem_size, -1)
-            mean_vae = self.mean(batch_memory_tokens)
-            log_var_vae  = self.log_var(batch_memory_tokens)
-
-            batch_memory_tokens = self.reparameterize(mean_vae, log_var_vae)
-
-            if self.training:
-                batch_memory_tokens += torch.randn_like(batch_memory_tokens) * 0.3
-
-            kl_segment = -0.5 * torch.mean(
-                1 + log_var_vae - mean_vae.pow(2) - log_var_vae.exp()
+            mu, logvar = self._encode_segment(input_ids[:, start_idx:end_idx])
+            latent = self.reparameterize(mu, logvar)
+            if self.training and self.latent_noise_std > 0:
+                latent = latent + torch.randn_like(latent) * self.latent_noise_std
+            latent_blocks.append(latent)
+            kl_terms.append(
+                -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
             )
-            total_kl_loss += kl_segment
 
-            # collect memory tokens
-            compress_outputs[:, segment_idx*self.mem_size: self.mem_size*(segment_idx+1)] = batch_memory_tokens
-            
-            del segment_input_ids, segment_input_embedding
-            torch.cuda.empty_cache()
+        compressed = torch.cat(latent_blocks, dim=1)
+        kl_loss = torch.stack(kl_terms).mean()
 
-            #print(f"===============Segment {segment_idx} END=======================")
-        
-        # decoder part
-        kl_loss = total_kl_loss / num_segments
+        prompt_answer_embs = self._decoder_text_embeddings(prompt_answer_ids)
+        decoder_mem_mask = (
+            (prompt_answer_ids >= self.vocab_size)
+            & (prompt_answer_ids < self.vocab_size + compressed.size(1))
+        )
+        expected_slots = batch_size * compressed.size(1)
+        if int(decoder_mem_mask.sum()) != expected_slots:
+            raise ValueError(
+                "Decoder prompt contains a different number of memory-token "
+                f"positions ({int(decoder_mem_mask.sum())}) than latent slots "
+                f"({expected_slots})."
+            )
+        decompressed = self.decompress_layer(compressed)
+        prompt_answer_embs[decoder_mem_mask] = decompressed.reshape(
+            -1, decompressed.size(-1)
+        )
 
-        decoder_mem_flag = (prompt_answer_ids >= self.vocab_size) & (prompt_answer_ids < self.vocab_size + self.mem_size)   # only mem tokens
-        #print("decoder_mem_flag shape: ", decoder_mem_flag.size())
-
-        decompress_outputs = self.decompress_layer(compress_outputs)
-        
-        prompt_answer_embs[decoder_mem_flag] = decompress_outputs.view(-1, decompress_outputs.size(-1))
-
-        special_prompt = prompt_answer_ids >= self.vocab_size_with_mem
-
-        prompt_answer_embs[special_prompt] = self.decompress_layer(self.memory_token_embed(prompt_answer_ids[special_prompt] - self.vocab_size)).view(-1, decompress_outputs.size(-1)).to(prompt_answer_embs)    # replace special token's embedding from self.memory_token_embed
-        
-        if self.training:   # has an independent self.decoder
-            decoder_outputs = self.decoder(inputs_embeds=prompt_answer_embs, output_hidden_states=True)
-        else:
-            with self.icae.disable_adapter():   # no independent decoder; use self.icae
-                decoder_outputs = self.icae(inputs_embeds=prompt_answer_embs, output_hidden_states=True)
-
+        decoder_attention_mask = prompt_answer_ids.ne(self.pad_token_id)
+        decoder_outputs = self.decoder(
+            inputs_embeds=prompt_answer_embs,
+            attention_mask=decoder_attention_mask,
+            position_ids=self._position_ids(decoder_attention_mask),
+            output_hidden_states=False,
+            use_cache=False,
+            return_dict=True,
+        )
         logits = decoder_outputs.logits
-        #print("decoder_outputs logits shape: ", logits.size())
-
-        effective_logits = logits[:,:-1,:].reshape(-1, logits.size(-1))  # Why are we skipping the last generated logit? It's probably the eos token.
-        #print("effective_logits shape: ", effective_logits.size())
-        target_ids = labels[:,1:].reshape(-1)  # Why does it take from the first index onwards?
-        #print("target_ids shape: ", target_ids.size())
-
+        effective_logits = logits[:, :-1, :].reshape(-1, logits.size(-1))
+        target_ids = labels[:, 1:].reshape(-1)
         ce_loss = self.loss_fct(effective_logits, target_ids)
         loss = ce_loss + self.beta * kl_loss
-        return {"loss": loss, "logits": logits, "kl_loss": kl_loss, "ce_loss": ce_loss}
+        return {
+            "loss": loss,
+            "logits": logits,
+            "kl_loss": kl_loss,
+            "ce_loss": ce_loss,
+        }
 
-    def decoder_loss(self, memory_slots, prompt_answer_ids, labels):
+    def decoder_loss(
+        self,
+        memory_slots: torch.Tensor,
+        prompt_answer_ids: torch.LongTensor,
+        labels: torch.LongTensor,
+    ):
         batch_size = memory_slots.size(0)
-                    
-        max_compressed_length = self.mem_size
-        prompt_answer_embs = self.icae.get_base_model().model.embed_tokens(prompt_answer_ids)
-        compress_outputs = torch.zeros((batch_size, max_compressed_length, self.dim)).to(prompt_answer_embs)
+        prompt_answer_ids = prompt_answer_ids.reshape(batch_size, -1)
+        prompt_answer_embs = self._decoder_text_embeddings(prompt_answer_ids)
 
-        # Convert memory_slots to the same dtype as prompt_answer_embs
-        memory_slots = memory_slots.to(dtype=prompt_answer_embs.dtype)
-        compress_outputs[:, :self.mem_size] = memory_slots
+        decoder_mem_mask = (
+            (prompt_answer_ids >= self.vocab_size)
+            & (prompt_answer_ids < self.vocab_size + memory_slots.size(1))
+        )
+        decompressed = self.decompress_layer(memory_slots.to(self.decompress_layer.weight.dtype))
+        prompt_answer_embs[decoder_mem_mask] = decompressed.reshape(
+            -1, decompressed.size(-1)
+        )
 
-        decoder_mem_flag = (prompt_answer_ids >= self.vocab_size) & (prompt_answer_ids < self.vocab_size + self.mem_size)   # only mem tokens
+        attention_mask = prompt_answer_ids.ne(self.pad_token_id)
+        outputs = self.decoder(
+            inputs_embeds=prompt_answer_embs,
+            attention_mask=attention_mask,
+            position_ids=self._position_ids(attention_mask),
+            use_cache=False,
+            return_dict=True,
+        )
+        logits = outputs.logits
+        ce_loss = self.loss_fct(
+            logits[:, :-1, :].reshape(-1, logits.size(-1)),
+            labels[:, 1:].reshape(-1),
+        )
+        return {"loss": ce_loss, "logits": logits}
 
-        # Decompress to model's hidden size
-        decompress_outputs = self.decompress_layer(compress_outputs)
-        
-        # Ensure the embeddings are in the correct shape for the model
-        prompt_answer_embs = prompt_answer_embs.to(dtype=decompress_outputs.dtype)
-        prompt_answer_embs[decoder_mem_flag] = decompress_outputs.view(-1, decompress_outputs.size(-1))
-
-        special_prompt = prompt_answer_ids >= self.vocab_size_with_mem
-
-        #print("self.memory_token_embed(prompt_answer_ids[special_prompt] - self.vocab_size).dtype", self.memory_token_embed(prompt_answer_ids[special_prompt] - self.vocab_size).dtype)
-
-        prompt_answer_embs[special_prompt] = self.decompress_layer(self.memory_token_embed(prompt_answer_ids[special_prompt] - self.vocab_size).to(prompt_answer_embs.dtype)).view(-1, decompress_outputs.size(-1))    # replace special token's embedding from self.memory_token_embed
-        prompt_answer_embs = prompt_answer_embs.reshape(batch_size, -1, decompress_outputs.size(-1))
-
-        print("prompt_answer_embs.shape", prompt_answer_embs.shape)
-
-        if self.training:   # has an independent self.decoder
-            decoder_outputs = self.decoder(inputs_embeds=prompt_answer_embs, output_hidden_states=True)
-        else:
-            with self.icae.disable_adapter():   # no independent decoder; use self.icae
-                decoder_outputs = self.icae(inputs_embeds=prompt_answer_embs, output_hidden_states=True)
-
-        logits = decoder_outputs.logits
-
-        effective_logits = logits[:,:-1,:].reshape(-1, logits.size(-1))  
-        target_ids = labels[:,1:].reshape(-1)  
-
-        ce_loss = self.loss_fct(effective_logits, target_ids)
-
-        return {"loss": ce_loss}
-
-    def tokens_to_embeddings(self, token_ids):   # input_tokens can be either normal tokens and special tokens
-        embeddings = self.icae.get_base_model().model.embed_tokens(token_ids)
-        special_flags = token_ids >= self.vocab_size
-        embeddings[special_flags] = self.decompress_layer(self.memory_token_embed(token_ids[special_flags] - self.vocab_size).to(embeddings))    # replace special token's embedding from self.memory_token_embed
+    def tokens_to_embeddings(self, token_ids: torch.Tensor) -> torch.Tensor:
+        """Map ordinary and VAE special IDs into frozen-decoder hidden space."""
+        embeddings = self._decoder_text_embeddings(token_ids)
+        special = token_ids >= self.vocab_size
+        if special.any():
+            latent_embeddings = self.memory_token_embed(
+                token_ids[special] - self.vocab_size
+            ).to(embeddings.dtype)
+            embeddings[special] = self.decompress_layer(latent_embeddings)
         return embeddings
 
     def _compress(
         self,
-        input_ids: torch.LongTensor = None,
-        return_sample = None
-    ):  # for inference; compress a fixed length of input into memory slots
+        input_ids: torch.LongTensor,
+        return_sample: Optional[str] = None,
+    ):
+        """Encode text blocks as posterior parameters, samples, or posterior means.
 
-        batch_size = input_ids.size(0)
-        total_length = input_ids.size(1)
+        ``return_sample='sample'`` applies only VAE reparameterization. The
+        robustness noise with std=3 is a VAE-training augmentation and is not
+        applied when exporting oracle latents for the diffusion model.
+        """
+        batch_size, total_length = input_ids.shape
         num_segments = self.compute_num_segments(total_length)
         segment_length = math.ceil(total_length / num_segments)
-        
-        max_compressed_length = num_segments * self.mem_size
-        compress_outputs = torch.zeros((batch_size, max_compressed_length, self.dim))
-        
+
+        means = []
+        logvars = []
         for segment_idx in range(num_segments):
             start_idx = segment_idx * segment_length
             end_idx = min((segment_idx + 1) * segment_length, total_length)
-            segment_input_ids = input_ids[:, start_idx:end_idx]
-            segment_input_ids = torch.cat([segment_input_ids, self.append_sequence.repeat(batch_size, 1)], dim=1)
-            mem_flag = segment_input_ids >= self.vocab_size
+            mu, logvar = self._encode_segment(input_ids[:, start_idx:end_idx])
+            means.append(mu)
+            logvars.append(logvar)
 
-            segment_input_embedding = self.icae.get_base_model().model.embed_tokens(segment_input_ids)
-            segment_input_embedding[mem_flag] = self.decompress_layer(self.memory_token_embed(segment_input_ids[mem_flag] - self.vocab_size).to(segment_input_embedding))
+        mean = torch.cat(means, dim=1)
+        logvar = torch.cat(logvars, dim=1)
+        if return_sample == "parameters":
+            return mean, logvar
+        if return_sample == "sample":
+            return self.reparameterize(mean, logvar)
+        if return_sample in (None, "", "mean"):
+            return mean
+        raise ValueError(
+            "return_sample must be one of None, '', 'mean', 'sample', or 'parameters'"
+        )
 
-            # compress the current segment
-            segment_compress_outputs = self.icae(inputs_embeds=segment_input_embedding, output_hidden_states=True)
-            segment_compress_outputs = segment_compress_outputs.hidden_states[-1]
-            batch_memory_tokens = segment_compress_outputs[mem_flag].view(batch_size, self.mem_size, -1)
+    def _tokenize_batch(self, texts: list[str], max_length: int = 5120) -> torch.Tensor:
+        encoded = [
+            self.tokenizer(
+                text,
+                truncation=True,
+                max_length=max_length,
+                padding=False,
+                return_attention_mask=False,
+            )["input_ids"]
+            for text in texts
+        ]
+        max_len = max(len(ids) for ids in encoded)
+        input_ids = torch.full(
+            (len(encoded), max_len),
+            self.pad_token_id,
+            dtype=torch.long,
+            device=self.device,
+        )
+        for index, ids in enumerate(encoded):
+            input_ids[index, : len(ids)] = torch.tensor(ids, device=self.device)
+        return input_ids
 
-            if return_sample == "parameters":
-                mean_vae = self.mean(batch_memory_tokens)
-                log_var_vae  = self.log_var(batch_memory_tokens)
-                compress_outputs = (mean_vae, log_var_vae)
-
-            elif return_sample == "sample":
-                log_var_vae = self.log_var(batch_memory_tokens)
-                mean_vae = self.mean(batch_memory_tokens)
-                batch_memory_tokens = self.reparameterize(mean_vae, log_var_vae) 
-                batch_memory_tokens += torch.randn_like(batch_memory_tokens) * 0.3
-                compress_outputs[:, segment_idx*self.mem_size: self.mem_size*(segment_idx+1)] = batch_memory_tokens
-
-            else: 
-                batch_memory_tokens = self.mean(batch_memory_tokens)
-                # collect memory tokens
-                compress_outputs[:, segment_idx*self.mem_size: self.mem_size*(segment_idx+1)] = batch_memory_tokens
-
-            del segment_input_ids, segment_input_embedding
-            torch.cuda.empty_cache()
-
-        return compress_outputs
-    
-    def run_inference(self, text: str):
+    def encode_text(self, text: str, return_sample: str = ""):
         self.eval()
         with torch.no_grad():
-            tokenized_text = self.tokenizer(text, truncation=True,
-                                          max_length=5120, padding=False,
-                                          return_attention_mask=False)
-            # Generate compressed outputs
-            input_ids = torch.LongTensor([tokenized_text['input_ids']]).to(self.device)
-            memory_slots = self._compress(input_ids)
-            prompt_ids = torch.LongTensor([[self.ae_token_id]]).to(self.device)
+            input_ids = self._tokenize_batch([text])
+            return self._compress(input_ids, return_sample=return_sample)
 
-            prompt_answer_embs = self.tokens_to_embeddings(prompt_ids)
-            memory_slots = memory_slots.to(self.device, prompt_answer_embs)
-            
-            decompress_memory_slots = self.decompress_layer(memory_slots)
-            decoder_input_embeddings = torch.cat((decompress_memory_slots.unsqueeze(0), prompt_answer_embs), dim=1)
-            output = decoder_input_embeddings.clone()
-
-            generate_text = []
-            past_key_values = None
-
-            # Generate text output
-            for i in range(100):
-                with self.icae.disable_adapter():   # no independent decoder; use self.icae
-                    out = self.icae(inputs_embeds=output, past_key_values=past_key_values, use_cache=True)
-                logit = out.logits[:, -1, :self.vocab_size-1]
-                past_key_values = out.past_key_values
-
-                next_token_id = torch.argmax(logit, dim=-1)
-                # print(next_token_id)
-                
-                if next_token_id.item() == 2:   # eos
-                    break
-
-                output = self.icae.get_base_model().model.embed_tokens(next_token_id).unsqueeze(1).to(self.device)
-                generate_text.append(next_token_id.item())
-
-            generated_text = self.tokenizer.decode(generate_text)
-
-        return generated_text
-
-    def encode_text(self, text, return_sample=""):
+    def encode_batch_text(self, text_list: list[str], return_sample: str = ""):
         self.eval()
         with torch.no_grad():
-            tokenized_text = self.tokenizer(text, truncation=True,
-                                          max_length=5120, padding=False,
-                                          return_attention_mask=False)
-            # Generate compressed outputs
-            input_ids = torch.LongTensor([tokenized_text['input_ids']]).to(self.device)
-            memory_slots = self._compress(input_ids, return_sample=return_sample)
-        return memory_slots
-    
-    def encode_batch_text(self, text_list, return_sample=""):
+            input_ids = self._tokenize_batch(text_list)
+            return self._compress(input_ids, return_sample=return_sample)
+
+    def _greedy_decode(
+        self,
+        memory_slots: torch.Tensor,
+        max_new_tokens: int = 256,
+    ) -> list[str]:
+        batch_size = memory_slots.size(0)
+        memory_slots = memory_slots.to(
+            device=self.device,
+            dtype=self.decompress_layer.weight.dtype,
+        )
+        # Figure 7 conditions the frozen decoder directly on the sampled
+        # thought tokens.  The first text token is predicted from the final
+        # latent position; there is no release-only AE delimiter.
+        prefix = self.decompress_layer(memory_slots)
+
+        outputs = self.decoder(inputs_embeds=prefix, use_cache=True, return_dict=True)
+        past_key_values = outputs.past_key_values
+        generated = [[] for _ in range(batch_size)]
+        finished = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
+
+        for _ in range(max_new_tokens):
+            next_ids = outputs.logits[:, -1, : self.base_vocab_size].argmax(dim=-1)
+            active = ~finished
+            for index in range(batch_size):
+                if active[index] and next_ids[index].item() != self.eos_id:
+                    generated[index].append(next_ids[index].item())
+            finished |= next_ids.eq(self.eos_id)
+            if finished.all():
+                break
+
+            decoder_ids = torch.where(
+                finished,
+                torch.full_like(next_ids, self.eos_id),
+                next_ids,
+            )
+            next_embeddings = self._decoder_embedding_layer()(decoder_ids).unsqueeze(1)
+            outputs = self.decoder(
+                inputs_embeds=next_embeddings,
+                past_key_values=past_key_values,
+                use_cache=True,
+                return_dict=True,
+            )
+            past_key_values = outputs.past_key_values
+
+        return [
+            self.tokenizer.decode(tokens, skip_special_tokens=True)
+            for tokens in generated
+        ]
+
+    def run_inference(self, text: str) -> str:
         self.eval()
         with torch.no_grad():
-            tokenized_text = self.tokenizer(text_list, truncation=True,
-                                          max_length=5120, padding=True,
-                                          return_attention_mask=False)
-            # Generate compressed outputs
-            input_ids = torch.LongTensor(tokenized_text['input_ids']).to(self.device)
-            memory_slots = self._compress(input_ids, return_sample=return_sample)
-        return memory_slots
-    
-    def decode_text(self, memory_slots):
+            memory_slots = self.encode_text(text, return_sample="mean")
+            return self._greedy_decode(memory_slots)[0]
+
+    def decode_text(self, memory_slots: torch.Tensor):
+        self.eval()
         with torch.no_grad():
-            prompt_ids = torch.LongTensor([[self.ae_token_id]]).to(self.device).repeat(memory_slots.shape[0], 1)
+            decoded = self._greedy_decode(memory_slots)
+        return decoded[0] if len(decoded) == 1 else decoded
 
-            prompt_answer_embs = self.tokens_to_embeddings(prompt_ids)
-
-            memory_slots = memory_slots.to(device=self.device, dtype=prompt_answer_embs.dtype)
-                        
-            # Concatenate and clone input embeddings
-            decompress_memory_slots = self.decompress_layer(memory_slots)
-            decoder_input_embeddings = torch.cat((decompress_memory_slots, prompt_answer_embs), dim=1)
-
-            output = decoder_input_embeddings.clone()
-
-            generate_text = []
-            past_key_values = None
-
-            # Generate text output
-            for i in range(100):
-                with self.icae.disable_adapter():   # no independent decoder; use self.icae
-                    out = self.icae(inputs_embeds=output, past_key_values=past_key_values, use_cache=True)
-                logit = out.logits[:, -1, :self.vocab_size-1]
-                past_key_values = out.past_key_values
-
-                next_token_id = torch.argmax(logit, dim=-1)
-                
-                if next_token_id.item() == 2:   # eos
-                    break
-
-                output = self.icae.get_base_model().model.embed_tokens(next_token_id).unsqueeze(1).to(self.device)
-                generate_text.append(next_token_id.item())
-
-            generated_text = self.tokenizer.decode(generate_text, skip_special_tokens=True)
-
-        return generated_text
-
-    def decode_text_batch(self, memory_slots):
-        """
-        Decode multiple memory slots in parallel to generate text for each slot.
-        
-        Args:
-            memory_slots: Tensor of shape (batch_size, memory_size, hidden_dim)
-            
-        Returns:
-            List of generated texts, one for each memory slot in the batch
-        """
+    def decode_text_batch(self, memory_slots: torch.Tensor) -> list[str]:
+        self.eval()
         with torch.no_grad():
-            batch_size = memory_slots.shape[0]
-            prompt_ids = torch.LongTensor([[self.ae_token_id]]).to(self.device).repeat(batch_size, 1)
-
-            prompt_answer_embs = self.tokens_to_embeddings(prompt_ids)
-
-            memory_slots = memory_slots.to(device=self.device, dtype=prompt_answer_embs.dtype)
-                        
-            # Concatenate and clone input embeddings
-            decompress_memory_slots = self.decompress_layer(memory_slots)
-            decoder_input_embeddings = torch.cat((decompress_memory_slots, prompt_answer_embs), dim=1)
-
-            output = decoder_input_embeddings.clone()
-
-            # Initialize lists to store generated tokens for each sequence in batch
-            generate_text = [[] for _ in range(batch_size)]
-            # Track which sequences have finished generating
-            finished_sequences = torch.zeros(batch_size, dtype=torch.bool, device=self.device)
-            past_key_values = None
-
-            # Generate text output
-            for i in range(100):
-                with self.icae.disable_adapter():   # no independent decoder; use self.icae
-                    out = self.icae(inputs_embeds=output, past_key_values=past_key_values, use_cache=True)
-                logit = out.logits[:, -1, :self.vocab_size-1]
-                past_key_values = out.past_key_values
-
-                next_token_ids = torch.argmax(logit, dim=-1)
-                
-                # Update finished sequences
-                finished_sequences = finished_sequences | (next_token_ids == 2)  # 2 is EOS token
-                
-                # If all sequences are finished, break
-                if finished_sequences.all():
-                    break
-
-                # Only process tokens for sequences that haven't finished
-                active_sequences = ~finished_sequences
-                if active_sequences.any():
-                    # Get embeddings for next tokens
-                    next_token_embeddings = self.icae.get_base_model().model.embed_tokens(next_token_ids).unsqueeze(1).to(self.device)
-                    
-                    # Update output only for active sequences
-                    output = next_token_embeddings
-                    
-                    # Store generated tokens for active sequences
-                    for idx in range(batch_size):
-                        if active_sequences[idx]:
-                            generate_text[idx].append(next_token_ids[idx].item())
-
-            # Decode all sequences
-            generated_texts = [self.tokenizer.decode(text, skip_special_tokens=True) for text in generate_text]
-
-        return generated_texts
+            return self._greedy_decode(memory_slots)
