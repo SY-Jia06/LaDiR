@@ -1,38 +1,94 @@
-#!/bin/bash
-set -e
+#!/usr/bin/env bash
+set -euo pipefail
 
-MASTER_ADDR=$(hostname -s)
+# Paper-aligned VAE defaults. Override these with environment variables.
+MODEL_NAME=${MODEL_NAME:-meta-llama/Llama-3.1-8B}
+OUTPUT_DIR=${OUTPUT_DIR:-checkpoints/vae-paper}
+DATASET_NAME=${DATASET_NAME:-}
+DATASET_CONFIG=${DATASET_CONFIG:-}
+TRAIN_FILE=${TRAIN_FILE:-}
+VALIDATION_FILE=${VALIDATION_FILE:-}
+RESPONSE_FIELD=${RESPONSE_FIELD:-}
+QUESTION_FIELD=${QUESTION_FIELD:-}
+NUM_GPUS=${NUM_GPUS:-8}
+MASTER_PORT=${MASTER_PORT:-46079}
 
-export PATH=$CUDA_HOME/bin:$PATH
-# export WANDB_API_KEY=your_wandb_api_key_here
-TASK="vae_train"
+LATENT_DIM=${LATENT_DIM:-512}
+NUM_LATENT_TOKENS=${NUM_LATENT_TOKENS:-4}
+LATENT_NOISE_STD=${LATENT_NOISE_STD:-3.0}
+TOKEN_SUBSTITUTION_PROB=${TOKEN_SUBSTITUTION_PROB:-0.3}
+BETA=${BETA:-1e-5}
+ENCODER_TUNING=${ENCODER_TUNING:-full}
 
-srun -e logs/$TASK.err -o logs/$TASK.out sh -c "python -m torch.distributed.run \
-    --node_rank \$((SLURM_PROCID)) \
-    --nnodes 1 \
-    --nproc_per_node 8 \
-    --master_addr \$(scontrol show hostnames \$SLURM_JOB_NODELIST | head -n 1) \
-    --master_port 46079 \
-    ../vae/train_vae.py \
-    --run_name vae_train \
-    --model_name_or_path \"meta-llama/Llama-3.1-8B\" \
-    --lora_r 512 \
-    --lora_alpha 256 \
-    --lora_dropout 0.05 \
-    --output_dir \"../checkpoints\" \
-    --input_type \"full_format\" \
-    --test_size 10 \
-    --max_steps 30000 \
-    --num_train_epochs 10 \
-    --learning_rate 2e-5 \
-    --lr_scheduler_type \"cosine\" \
-    --lr_scheduler_kwargs '{\"num_cycles\": 1}' \
-    --warmup_steps 1000 \
-    --optim \"adamw_torch\" \
-    --weight_decay 0.03 \
-    --eval_strategy \"no\" \
-    --eval_interval 1 \
-    --ddp_backend \"nccl\" \
-    --fsdp \"hybrid_shard auto_wrap\" \
-    --fsdp_config '{\"backward_prefetch\": \"backward_pre\", \"forward_prefetch\": true, \"cpu_ram_efficient_loading\": true, \"sync_module_states\": true, \"transformer_layer_cls_to_wrap\": [\"LlamaDecoderLayer\"], \"use_orig_params\": true, \"activation_checkpointing\": false}' \
-    --notes \"VAE training experiment\""
+PER_DEVICE_BATCH_SIZE=${PER_DEVICE_BATCH_SIZE:-1}
+GRADIENT_ACCUMULATION_STEPS=${GRADIENT_ACCUMULATION_STEPS:-16}
+MAX_BLOCK_TOKENS=${MAX_BLOCK_TOKENS:-256}
+NUM_EPOCHS=${NUM_EPOCHS:-2}
+LEARNING_RATE=${LEARNING_RATE:-2e-5}
+PREPROCESSING_WORKERS=${PREPROCESSING_WORKERS:-8}
+
+if [[ -z "${DATASET_NAME}" && -z "${TRAIN_FILE}" ]]; then
+  echo "Set DATASET_NAME for a Hugging Face dataset or TRAIN_FILE for local JSON/JSONL/Parquet." >&2
+  exit 2
+fi
+if [[ -n "${DATASET_NAME}" && -n "${TRAIN_FILE}" ]]; then
+  echo "Set only one of DATASET_NAME and TRAIN_FILE." >&2
+  exit 2
+fi
+
+ARGS=(
+  --model_name_or_path "${MODEL_NAME}"
+  --output_dir "${OUTPUT_DIR}"
+  --latent_dim "${LATENT_DIM}"
+  --num_latent_tokens "${NUM_LATENT_TOKENS}"
+  --latent_noise_std "${LATENT_NOISE_STD}"
+  --token_substitution_prob "${TOKEN_SUBSTITUTION_PROB}"
+  --beta "${BETA}"
+  --encoder_tuning "${ENCODER_TUNING}"
+  --block_mode sentence
+  --reasoning_extraction think_or_full
+  --max_block_tokens "${MAX_BLOCK_TOKENS}"
+  --preprocessing_num_workers "${PREPROCESSING_WORKERS}"
+  --num_train_epochs "${NUM_EPOCHS}"
+  --learning_rate "${LEARNING_RATE}"
+  --per_device_train_batch_size "${PER_DEVICE_BATCH_SIZE}"
+  --per_device_eval_batch_size "${PER_DEVICE_BATCH_SIZE}"
+  --gradient_accumulation_steps "${GRADIENT_ACCUMULATION_STEPS}"
+  --bf16 true
+  --gradient_checkpointing true
+  --do_train true
+  --do_eval true
+  --eval_strategy steps
+  --eval_steps 1000
+  --save_strategy steps
+  --save_steps 1000
+  --logging_steps 10
+  --warmup_ratio 0.03
+  --lr_scheduler_type cosine
+  --report_to wandb
+)
+
+if [[ -n "${DATASET_NAME}" ]]; then
+  ARGS+=(--dataset_name "${DATASET_NAME}")
+else
+  ARGS+=(--train_file "${TRAIN_FILE}")
+fi
+if [[ -n "${DATASET_CONFIG}" ]]; then
+  ARGS+=(--dataset_config "${DATASET_CONFIG}")
+fi
+if [[ -n "${VALIDATION_FILE}" ]]; then
+  ARGS+=(--validation_file "${VALIDATION_FILE}")
+fi
+if [[ -n "${RESPONSE_FIELD}" ]]; then
+  ARGS+=(--response_field "${RESPONSE_FIELD}")
+fi
+if [[ -n "${QUESTION_FIELD}" ]]; then
+  ARGS+=(--question_field "${QUESTION_FIELD}")
+fi
+
+cd "$(dirname "$0")/../vae"
+torchrun \
+  --standalone \
+  --nproc_per_node "${NUM_GPUS}" \
+  --master_port "${MASTER_PORT}" \
+  train_vae.py "${ARGS[@]}"
