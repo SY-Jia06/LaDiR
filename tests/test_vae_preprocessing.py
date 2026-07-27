@@ -9,7 +9,7 @@ import types
 import unittest
 
 
-# data_vae imports Hugging Face datasets for the full input pipeline.  Stub the
+# data_vae imports Hugging Face datasets for the full input pipeline. Stub the
 # symbol here so the pure split functions can be tested in lightweight CI.
 datasets_stub = types.ModuleType("datasets")
 datasets_stub.Dataset = object
@@ -37,6 +37,24 @@ class VAEPreprocessingTest(unittest.TestCase):
         self.assertEqual(
             blocks,
             ["Let x = 3.5.", "Then 2x = 7.", "Therefore x is valid."],
+        )
+
+    def test_sentence_blockization_preserves_common_abbreviations(self):
+        blocks = data_vae.split_sentence_blocks(
+            "Use Eq. 3, e.g. the quadratic formula. Then simplify."
+        )
+        self.assertEqual(
+            blocks,
+            ["Use Eq. 3, e.g. the quadratic formula.", "Then simplify."],
+        )
+
+    def test_sentence_blockization_preserves_initialisms(self):
+        blocks = data_vae.split_sentence_blocks(
+            "The U.S. value is 4. Therefore the result follows."
+        )
+        self.assertEqual(
+            blocks,
+            ["The U.S. value is 4.", "Therefore the result follows."],
         )
 
     def test_missing_answer_prefix_is_explicit(self):
