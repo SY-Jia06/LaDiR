@@ -28,9 +28,22 @@ complete hyperparameter Table 13 lists four. The blockization ablation in Table
 This reproduction therefore defaults to four, while exposing
 `--fixed_mem_size` for a six-token ablation.
 
+## Information the paper does not provide
+
+The downstream YAML contains `scale_factor=0.2154` and `shift_factor=0.2192`,
+but the paper does not define how these statistics were estimated. They are
+therefore documented as release-checkpoint values, not treated as valid
+statistics for a newly trained VAE. Before diffusion training, measure the new
+checkpoint's latent distribution and verify the downstream affine convention.
+
+Likewise, the paper gives the principal VAE hyperparameters but does not state
+all optimizer details such as warmup length and weight decay. The launcher keeps
+those secondary values explicit rather than presenting them as paper claims.
+
 ## Scope and verification
 
 The patch covers the VAE data, model, teacher-forcing objective, inference
-path, and launcher. Static compilation, shell validation, and sentence-splitting
-unit tests are included. It does not claim the published benchmark numbers
-until the full 8B multi-GPU training run has completed on the paper data.
+path, dependencies, and launcher. Static compilation, shell validation,
+preprocessing tests, teacher-forcing tests, and a tiny mocked model smoke test
+pass. It does not claim the published benchmark numbers until the full 8B
+multi-GPU training run has completed on the paper data.
