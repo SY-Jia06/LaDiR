@@ -51,6 +51,7 @@ class FakeCausalLM(nn.Module):
     def resize_token_embeddings(self, size):
         old = self.embed
         self.embed = nn.Embedding(size, 8, dtype=torch.bfloat16)
+        self.config.vocab_size = size
         with torch.no_grad():
             self.embed.weight[: old.num_embeddings].copy_(old.weight)
         return self.embed
@@ -58,7 +59,12 @@ class FakeCausalLM(nn.Module):
     def forward(self, inputs_embeds, use_cache=False, **kwargs):
         del kwargs
         batch, length, _ = inputs_embeds.shape
-        logits = torch.zeros(batch, length, 32, device=inputs_embeds.device)
+        logits = torch.zeros(
+            batch,
+            length,
+            self.config.vocab_size,
+            device=inputs_embeds.device,
+        )
         logits[..., 2] = 1.0
         return SimpleNamespace(
             logits=logits,
@@ -138,6 +144,9 @@ class VAEModelInterfaceTest(unittest.TestCase):
         mean, logvar = model._compress(input_ids, return_sample="parameters")
         self.assertEqual(mean.shape, (2, 4, 512))
         self.assertEqual(logvar.shape, (2, 4, 512))
+
+        with self.assertRaisesRegex(ValueError, "unknown VAE special token"):
+            model.tokens_to_embeddings(torch.tensor([[model.ae_token_id]]))
 
 
 if __name__ == "__main__":
