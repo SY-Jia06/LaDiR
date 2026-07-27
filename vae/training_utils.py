@@ -80,8 +80,9 @@ def pretrain_tokenize_function(
 ):
     """Tokenize one sentence per fixed-size latent block.
 
-    The decoder context is limited to ``model_max_length`` including the memory
-    prefix and terminal EOS token. Several arguments are retained for call-site
+    The encoder and decoder contexts are limited to ``model_max_length`` after
+    accounting for the memory prefix; the decoder budget also includes a
+    terminal EOS token. Several arguments are retained for call-site
     compatibility with the original release. The paper-aligned recipe is a pure
     autoencoding objective (``lm_ratio=0``) and does not insert the release-only
     AE token.
@@ -102,23 +103,26 @@ def pretrain_tokenize_function(
         )
     if model_max_length <= mem_size:
         raise ValueError(
-            "model_max_length must be greater than mem_size so the decoder "
-            "has room for at least one target token"
+            "model_max_length must be greater than mem_size so the encoder and "
+            "decoder have room for text tokens"
         )
 
     encoder_texts = examples[input_type]
     target_texts = examples["chain_of_thought"]
+    # Both encoder and decoder append the fixed memory prefix, so reserve it
+    # inside the configured context limit on both sides.
+    text_budget = model_max_length - mem_size
     encoder_outputs = tokenizer(
         encoder_texts,
         truncation=True,
-        max_length=model_max_length,
+        max_length=text_budget,
         padding=False,
         return_attention_mask=False,
     )
 
-    # Reserve the memory prefix inside the decoder's context budget. EOS is
-    # enforced below by replacing the last target token when the budget is full.
-    target_budget = model_max_length - mem_size
+    # EOS is enforced below by replacing the final target token when the budget
+    # is already full.
+    target_budget = text_budget
     target_outputs = tokenizer(
         target_texts,
         truncation=True,
