@@ -1,10 +1,10 @@
-# LaDiR VAE Reproduction Notes
+# LaDiR Reproduction Notes
 
 This audit treats the current ICLR 2026 paper (arXiv:2510.04573v6) as the
-reference and modifies the released VAE implementation in place. It does not
-replace the repository with a new VAE architecture.
+reference and modifies the released implementation in place. It does not claim
+published benchmark numbers without full 8B multi-GPU training.
 
-## Paper-to-code alignment
+## VAE paper-to-code alignment
 
 | Item | Paper recipe | Released code | Reproduction change |
 |---|---|---|---|
@@ -22,13 +22,28 @@ replace the repository with a new VAE architecture.
 | Decoder context | Latent prefix and target must fit the model context | Target truncated before adding memory tokens and EOS | Reserve the memory prefix inside `model_max_length` and force EOS within budget |
 | Backbone interface | Paper uses Llama-3.1-8B | Generic `AutoModelForCausalLM` path implied broader support | Validate Llama model type and use its transformer backbone explicitly |
 
-## Deliberately unsupported release path
+## Reasoner paper-to-code alignment
+
+| Item | Paper recipe | Released code | Reproduction change |
+|---|---|---|---|
+| Training data | Ordered one-sentence VAE blocks | Whole question/solution sent through `_compress` | Precompute ordered frozen-VAE blocks in a validated memory-mapped store |
+| Latent dimension | 512 | Hard-coded 128 | Infer/validate 512 from config and latent metadata |
+| Block attention | Bidirectional inside a block, causal across blocks | Global handling of every `<tht>` token as one bidirectional set | Build a separate explicit span for each block |
+| Denoising objective | Flow matching by default | Placeholder additive scheduler and fixed update | Implement the linear rectified-flow path and Euler integration |
+| Objective ablations | MSE, x0, epsilon, v, flow | Not executable | One scheduler interface exposes all five objectives |
+| Answer supervision | CE from the same LLM backbone | Commented out | Train answer tokens after `<SOA>` with EOS supervision |
+| Variable block count | Binary `<BOT>`/`<SOA>` head at `<EOT>` | Missing | Add the binary head, loss, and inference stopping rule |
+| Stage 1 | Oracle previous latent blocks | One flattened thought target | Train every target block conditioned on earlier oracle blocks |
+| Stage 2 | Self-generated previous blocks, 10 denoising steps, gradients retained | Missing | Differentiable Euler rollouts with the ground-truth block count |
+| CFG/diversity | CFG plus decaying repulsive guidance | Partial debug methods | Expose both in the common block sampler |
+| Training recipe | Stage 1 batch 64; Stage 2 batch 12; LR `1e-5`; 20 epochs | Inconsistent VAE-oriented config | Separate Stage-1 and Stage-2 YAML/launchers |
+
+## Deliberately unsupported VAE release path
 
 The release's length-driven multi-segment encoder reused one set of memory-token
 IDs while producing multiple latent groups. That layout cannot satisfy the
 paper decoder interface, which expects one fixed latent block before the target
-sentence. The reproduction therefore fails fast when `paper_block_mode=False`
-instead of advertising a compatibility mode that breaks at decoder masking.
+sentence. The reproduction therefore fails fast when `paper_block_mode=False`.
 
 ## Sentence blockization
 
@@ -45,31 +60,48 @@ Before full training, inspect the real data with:
 python scripts/audit_vae_blocks.py --input data/vae_train.jsonl --show 20
 ```
 
-## Paper inconsistency retained as an explicit choice
+## Paper ambiguities and explicit choices
+
+### Four versus six latent tokens
 
 Appendix D.1 states that math reasoning uses six latent tokens, while the later
 complete hyperparameter Table 13 lists four. The blockization ablation in Table
 7 also identifies one sentence with four latent tokens as the best balance.
-This reproduction therefore defaults to four, while exposing
-`--fixed_mem_size` for a six-token ablation.
+This reproduction defaults to four and leaves the value configurable.
 
-## Information the paper does not provide
+### Oracle latent sampling
 
-The downstream YAML contains `scale_factor=0.2154` and `shift_factor=0.2192`,
-but the paper does not define how these statistics were estimated. They are
-therefore documented as release-checkpoint values, not treated as valid
-statistics for a newly trained VAE. Before diffusion training, measure the new
-checkpoint's latent distribution and verify the downstream affine convention.
+The method samples VAE latents from the posterior, but it does not say whether a
+fresh posterior sample is drawn every reasoner epoch. The practical default
+precomputes one posterior sample per block. `--latent-mode mean` provides a
+deterministic comparison; online resampling is deliberately not the default
+because it would keep the large VAE resident during reasoner training.
 
-Likewise, the paper gives the principal VAE hyperparameters but does not state
-all optimizer details such as warmup length and weight decay. The launcher keeps
-those secondary values explicit rather than presenting them as paper claims.
+### Target-block batching
+
+The paper does not state whether all target blocks from one solution are trained
+in one forward pass or sampled as separate instances. The implementation can
+use all valid target blocks (`target_block_sampling=all`) or one random target
+per sample (`random`) so this choice can be measured rather than hidden.
+
+### Secondary optimizer and CFG details
+
+The paper gives principal learning rates, batch sizes, epochs, loss weights,
+and inference CFG scale, but not every optimizer, warmup, or condition-dropout
+detail. Those settings remain explicit in YAML and are not presented as paper
+claims. The release checkpoint's latent `scale_factor` and `shift_factor` are
+also not applied to a newly trained VAE without re-estimation.
 
 ## Scope and verification
 
-The patch covers the VAE data, model, teacher-forcing objective, inference
-path, dependencies, and launcher. Static compilation, shell validation,
-preprocessing tests, teacher-forcing tests, context-budget tests, padding tests,
-and a mocked model-interface smoke test pass. It does not claim the published
-benchmark numbers until the full 8B multi-GPU training run has completed on the
-paper data.
+The patch covers VAE preprocessing/model training and the non-VAE reasoner:
+latent precomputation, blockwise masking, objective parameterizations, joint
+losses, Stage-1/Stage-2 training, stopping, answer generation, CFG, diversity
+guidance, a shared comparison evaluator, and auditable experiment matrices.
+Static compilation, shell validation, scheduler tests, latent-store tests,
+Stage-1 backward tests, differentiable Stage-2 rollout tests, metric utility
+tests, and matrix-expansion tests pass.
+
+It does not claim numerical reproduction until the real data, gated backbone,
+trained VAE, long multi-GPU runs, and benchmark-specific evaluators have been
+executed and audited.

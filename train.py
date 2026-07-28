@@ -1,143 +1,184 @@
-import torch
-from transformers.training_args import TrainingArguments
-from transformers.models.auto.tokenization_auto import AutoTokenizer
-from transformers.models.auto.modeling_auto import AutoModelForCausalLM
-from transformers.models.auto.configuration_auto import AutoConfig
-from transformers import Trainer
-from config import LMFusionConfig
-from dataset import ThoughtDataset, ThoughtDataCollator
-from model import LMFusionModel
-import os
+#!/usr/bin/env python3
+"""Train the LaDiR reasoning model (Stage 1 or Stage 2)."""
+
+from __future__ import annotations
+
+import argparse
+import json
+from pathlib import Path
+from typing import Any, Optional
+
+from omegaconf import OmegaConf
 from safetensors.torch import load_file
-import pathlib
-from omegaconf import OmegaConf as om
-from vae.model_vae import VAE
-from vae.vae_args import parse_args
-from peft import LoraConfig
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer, Trainer, TrainingArguments
+
+from dataset import ReasoningDataCollator, ReasoningLatentDataset
+from model import LaDiRReasoner, configure_reasoner_tokenizer
 
 
-def main(cfg):
+def parse_cli() -> tuple[argparse.Namespace, list[str]]:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "config",
+        nargs="?",
+        default="configs/reasoner_stage1.yaml",
+        help="OmegaConf YAML file",
+    )
+    parser.add_argument(
+        "--init-from",
+        default=None,
+        help="Optional Stage-1/Stage-2 model.safetensors checkpoint",
+    )
+    args, overrides = parser.parse_known_args()
+    return args, overrides
 
-    print(f'run name: {cfg.run_name}')
-    local_rank = int(os.environ["LOCAL_RANK"])
-    local_rank = torch.device(local_rank)
 
-    # AE
-    ae_lora_config = LoraConfig(
-        r=cfg.ae.lora_r,
-        lora_alpha=cfg.ae.lora_alpha,
-        lora_dropout=cfg.ae.lora_dropout,
-        bias="none",
-        task_type="CAUSAL_LM"
+def resolve_dtype(name: str) -> torch.dtype:
+    mapping = {
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float16": torch.float16,
+        "fp16": torch.float16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+    }
+    if name not in mapping:
+        raise ValueError(f"unsupported torch dtype {name!r}")
+    return mapping[name]
+
+
+def load_config(path: str, overrides: list[str]) -> Any:
+    cfg = OmegaConf.load(path)
+    if overrides:
+        cfg = OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
+    OmegaConf.resolve(cfg)
+    return cfg
+
+
+def make_dataset(
+    tokenizer: Any, cfg: Any, split: str
+) -> Optional[ReasoningLatentDataset]:
+    section = cfg.data
+    manifest = section.get(f"{split}_manifest")
+    latents = section.get(f"{split}_latents")
+    if not manifest or not latents:
+        return None
+    metadata = section.get(f"{split}_metadata")
+    return ReasoningLatentDataset(
+        tokenizer,
+        str(manifest),
+        str(latents),
+        metadata_path=str(metadata) if metadata else None,
+        max_question_length=int(section.max_question_length),
+        max_answer_length=int(section.max_answer_length),
+        max_blocks=(
+            int(section.max_blocks)
+            if section.get("max_blocks") is not None
+            else None
+        ),
     )
 
-    ae_model_args, ae_training_args, ae_args = parse_args()
-    ae = VAE(ae_model_args, ae_training_args, ae_lora_config)
-    print(f"Loading trained checkpoint from {cfg.ae.icae_ckpt}")
 
-    state_dict = load_file(cfg.ae.icae_ckpt)
-
-    if "state_dict" in state_dict:
-        missing_keys, unexpected_keys = ae.load_state_dict(state_dict["state_dict"], strict=False)  # Allow missing keys if needed
-    else:
-        missing_keys, unexpected_keys = ae.load_state_dict(state_dict, strict=False)
-
-    for p in ae.parameters():
-        p.requires_grad = False
-        
-    ae = ae.to(local_rank, dtype=torch.bfloat16)
-
-    TEXT_LLAMA_PATH = cfg.model.llm_model_name_or_path
-
-    # Load text LLaMA
-    text_llama_config = AutoConfig.from_pretrained(TEXT_LLAMA_PATH, use_flash_attention=False, _flash_attn_2_enabled=False)
+def load_initial_checkpoint(model: torch.nn.Module, checkpoint: str) -> None:
+    path = Path(checkpoint)
+    if path.is_dir():
+        path = path / "model.safetensors"
+    if not path.is_file():
+        raise FileNotFoundError(path)
+    incompatible = model.load_state_dict(load_file(str(path)), strict=False)
+    if incompatible.missing_keys:
+        print(f"initial checkpoint missing keys: {incompatible.missing_keys[:30]}")
+    if incompatible.unexpected_keys:
+        print(
+            f"initial checkpoint unexpected keys: "
+            f"{incompatible.unexpected_keys[:30]}"
+        )
 
 
-    text_llama = AutoModelForCausalLM.from_pretrained(TEXT_LLAMA_PATH, 
-                                                  config=text_llama_config,
-                                                    torch_dtype=torch.bfloat16, # or torch.bfloat16
-                                                  )
+def main() -> None:
+    args, overrides = parse_cli()
+    cfg = load_config(args.config, overrides)
+    print(OmegaConf.to_yaml(cfg, resolve=True))
 
-    text_tokenizer = AutoTokenizer.from_pretrained(TEXT_LLAMA_PATH)
-
-    text_tokenizer.pad_token_id = text_tokenizer.eos_token_id
-
-    BOT_TOKEN = "<tht_s>"
-    THT_TOKEN = "<tht>"
-    EOT_TOKEN = "</tht_s>"
-    TIME_TOKEN = "<timestep>"
-    for special_token in [BOT_TOKEN, THT_TOKEN, EOT_TOKEN, TIME_TOKEN]:
-        special_tokens_dict = {"additional_special_tokens": [special_token]}
-        text_tokenizer.add_special_tokens(special_tokens_dict)
-    text_tokenizer.bot_token_id = text_tokenizer.convert_tokens_to_ids(BOT_TOKEN)
-    text_tokenizer.tht_token_id = text_tokenizer.convert_tokens_to_ids(THT_TOKEN)
-    text_tokenizer.eot_token_id = text_tokenizer.convert_tokens_to_ids(EOT_TOKEN)
-    
-    text_tokenizer.time_token_id = text_tokenizer.convert_tokens_to_ids(TIME_TOKEN)
-
-    text_tokenizer.pad_token_id = text_tokenizer.eos_token_id
-
-    # Freeze all autoencoder parameters
-    for param in ae.parameters():
-        param.requires_grad = False
-
-    # Initialize our LMFusion model
-    model = LMFusionModel(
-        text_llama=text_llama,
-        thought_llama=None,
-        autoencoder=ae,
-        model_config=cfg,
-        tokenizer=text_tokenizer,
-        hidden_dim=text_llama_config.hidden_size,
-        freeze_text=False
-    ).to(dtype=torch.bfloat16)
-
-    cfg.n_params = sum(p.numel() for p in model.parameters())
-    cfg.n_trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f'{cfg.n_params=:.6e}, {cfg.n_trainable_params=:.6e}')
-
-    # c) Create a toy dataset
-    train_dataset = ThoughtDataset(
-        text_tokenizer,
-        cfg.dataset.train_file,
+    model_name = str(cfg.model.model_name_or_path)
+    dtype = resolve_dtype(str(cfg.model.get("torch_dtype", "bfloat16")))
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_name,
+        use_fast=bool(cfg.model.get("use_fast_tokenizer", False)),
     )
+    causal_lm = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=dtype,
+        # Llama's eager path accepts the explicit 4D hybrid additive mask.
+        attn_implementation=str(cfg.model.get("attn_implementation", "eager")),
+    )
+    token_ids = configure_reasoner_tokenizer(tokenizer, causal_lm)
+    model = LaDiRReasoner(causal_lm, tokenizer, cfg, token_ids=token_ids)
 
-    data_collator = ThoughtDataCollator(pad_token_id=text_tokenizer.pad_token_id)
+    init_from = args.init_from or cfg.model.get("init_from")
+    if init_from:
+        print(f"loading initial reasoner checkpoint from {init_from}")
+        load_initial_checkpoint(model, str(init_from))
 
-    print(len(train_dataset))
+    train_dataset = make_dataset(tokenizer, cfg, "train")
+    if train_dataset is None:
+        raise ValueError("data.train_manifest and data.train_latents are required")
+    eval_dataset = make_dataset(tokenizer, cfg, "validation")
+    if (
+        train_dataset.latent_dim != model.latent_dim
+        or train_dataset.latent_tokens_per_block
+        != model.latent_tokens_per_block
+    ):
+        raise ValueError(
+            "precomputed VAE shape does not match the reasoner config: "
+            f"dataset=({train_dataset.latent_tokens_per_block}, "
+            f"{train_dataset.latent_dim}), model=("
+            f"{model.latent_tokens_per_block}, {model.latent_dim})"
+        )
 
-    training_args = TrainingArguments(**om.to_container(cfg.trainer, resolve=True))
-
+    training_payload = OmegaConf.to_container(cfg.trainer, resolve=True)
+    if not isinstance(training_payload, dict):
+        raise TypeError("trainer config must be a mapping")
+    training_args = TrainingArguments(**training_payload)
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=train_dataset,
-        data_collator=data_collator,
+        eval_dataset=eval_dataset,
+        data_collator=ReasoningDataCollator(tokenizer.pad_token_id),
     )
 
-    trainable_params = [n for n, p in trainer.model.autoencoder.named_parameters() if p.requires_grad]
-    print(f"Before training Trainable AE parameters:\n{trainable_params}")
+    trainable = sum(
+        parameter.numel()
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+    total = sum(parameter.numel() for parameter in model.parameters())
+    print(f"trainable parameters: {trainable:,}/{total:,}")
+    print(
+        f"stage={model.stage} objective={model.objective} "
+        f"train_samples={len(train_dataset):,}"
+    )
 
-    if cfg.allow_resume and list(pathlib.Path(cfg.trainer.output_dir).glob('checkpoint*')):
-        print('Resume from last checkpoint!!!!')
-        trainer.train(resume_from_checkpoint=True)
-    else:
-        trainer.train()
-    print('Done.')
+    output_dir = Path(training_args.output_dir)
+    has_checkpoint = any(output_dir.glob("checkpoint-*"))
+    resume = bool(cfg.get("allow_resume", True) and has_checkpoint)
+    result = trainer.train(resume_from_checkpoint=True if resume else None)
+    trainer.save_model()
+    trainer.save_state()
+    if trainer.is_world_process_zero():
+        output_dir.mkdir(parents=True, exist_ok=True)
+        with (output_dir / "resolved_config.yaml").open(
+            "w", encoding="utf-8"
+        ) as handle:
+            handle.write(OmegaConf.to_yaml(cfg, resolve=True))
+        with (output_dir / "train_metrics.json").open(
+            "w", encoding="utf-8"
+        ) as handle:
+            json.dump(result.metrics, handle, indent=2)
+            handle.write("\n")
 
-if __name__ == '__main__':
-    import sys
-    import os
 
-    if 'RANK' in os.environ:
-        import torch.distributed as dist
-        dist.init_process_group(backend='nccl')
-
-    #yaml_path, args_list = sys.argv[1], sys.argv[2:]
-    args_list = sys.argv[1:]
-    yaml_path = "configs/cd_formal_8B_VAE_conn.yaml"
-    with open(yaml_path) as f:
-        yaml_cfg = om.load(f)
-    cli_cfg = om.from_cli(args_list)
-    cfg = om.merge(yaml_cfg, cli_cfg)
-    main(cfg)
+if __name__ == "__main__":
+    main()
