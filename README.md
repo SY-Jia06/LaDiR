@@ -138,6 +138,45 @@ the stopping head predicts `<SOA>`, then generates answer tokens
 autoregressively. It exposes denoising steps, initial-noise scale,
 classifier-free guidance, and diversity guidance as inference arguments.
 
+## Comparisons and ablations
+
+Use one evaluator for both LaDiR checkpoints and autoregressive baselines. It
+writes raw generations plus a summary containing Pass@k and output diversity:
+
+```bash
+python evaluate.py ladir \
+  --config configs/reasoner_stage2.yaml \
+  --checkpoint checkpoints/reasoner_stage2/model.safetensors \
+  --input data/eval.jsonl \
+  --output-dir results/ladir \
+  --num-samples 100
+
+python evaluate.py ar \
+  --model-name-or-path meta-llama/Llama-3.1-8B \
+  --checkpoint checkpoints/ar_sft \
+  --input data/eval.jsonl \
+  --output-dir results/ar_sft \
+  --num-samples 100
+```
+
+The built-in `exact` and `last_number` checkers are smoke metrics. For a real
+benchmark, pass `--checker package.module:function`; the callable receives the
+prediction, reference, and original JSON record. This prevents a generic regex
+from being mistaken for the paper's task-specific evaluation.
+
+`configs/reasoner_experiments.yaml` covers Stage-1 versus Stage-2 comparisons,
+latent objectives, answer/stopping losses, target-block sampling, block size,
+denoising steps, initial noise, and diversity strength. Inspect the commands
+before launching them:
+
+```bash
+python scripts/run_experiment_matrix.py --group objective
+python scripts/run_experiment_matrix.py --group denoising_steps --execute
+```
+
+Executed jobs append their command, return code, timestamps, and git revision
+to `results/experiment_manifest.jsonl`.
+
 ## Validation performed in this repository
 
 The lightweight tests do not download a model:
@@ -149,13 +188,15 @@ python -m unittest -v \
   tests/test_vae_model_interface.py \
   tests/test_flow_scheduler.py \
   tests/test_reasoner_dataset.py \
-  tests/test_reasoner_model.py
+  tests/test_reasoner_model.py \
+  tests/test_evaluation_utils.py \
+  tests/test_experiment_matrix.py
 ```
 
 The reasoner suite covers exact scheduler conversions, latent-store collation,
-the blockwise attention contract, joint Stage-1 losses, and differentiable
-Stage-2 rollout with a mocked causal LM. Python files compile and shell
-launchers pass `bash -n`.
+the blockwise attention contract, joint Stage-1 losses, differentiable Stage-2
+rollout, evaluation utilities, and experiment-matrix expansion. Python files
+compile and shell launchers pass `bash -n`.
 
 A full numerical reproduction still requires the paper dataset, the gated 8B
 backbone, the trained VAE, and multi-GPU training. Passing the lightweight tests

@@ -96,9 +96,11 @@ also not applied to a newly trained VAE without re-estimation.
 
 The patch covers VAE preprocessing/model training and the non-VAE reasoner:
 latent precomputation, blockwise masking, objective parameterizations, joint
-losses, Stage-1/Stage-2 training, stopping, answer generation, CFG, and diversity
-guidance. Static compilation, shell validation, scheduler tests, latent-store
-tests, Stage-1 backward tests, and differentiable Stage-2 rollout tests pass.
+losses, Stage-1/Stage-2 training, stopping, answer generation, CFG, diversity
+guidance, a shared comparison evaluator, and auditable experiment matrices.
+Static compilation, shell validation, scheduler tests, latent-store tests,
+Stage-1 backward tests, differentiable Stage-2 rollout tests, metric utility
+tests, and matrix-expansion tests pass.
 
 It does not claim numerical reproduction until the real data, gated backbone,
 trained VAE, long multi-GPU runs, and benchmark-specific evaluators have been

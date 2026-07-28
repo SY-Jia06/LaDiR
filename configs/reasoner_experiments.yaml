@@ -1,0 +1,152 @@
+# Reproducible command matrix for the paper's main comparisons and ablations.
+# Paths are deliberately explicit placeholders; edit or override them before
+# execution. Use scripts/run_experiment_matrix.py without --execute to inspect.
+
+groups:
+  comparisons:
+    jobs:
+      - name: comparison-ar-sft
+        command: >-
+          python evaluate.py ar
+          --model-name-or-path meta-llama/Llama-3.1-8B
+          --checkpoint checkpoints/ar_sft
+          --input data/eval.jsonl
+          --output-dir results/comparisons/ar_sft
+          --num-samples 100
+          --checker last_number
+      - name: comparison-ladir-stage1-no-rollout
+        command: >-
+          python evaluate.py ladir
+          --config configs/reasoner_stage1.yaml
+          --checkpoint checkpoints/reasoner_stage1/model.safetensors
+          --input data/eval.jsonl
+          --output-dir results/comparisons/ladir_stage1
+          --num-samples 100
+          --num-steps 50
+          --initial-noise-scale 2
+          --diversity-scale 0.8
+          --checker last_number
+      - name: comparison-ladir-stage2
+        command: >-
+          python evaluate.py ladir
+          --config configs/reasoner_stage2.yaml
+          --checkpoint checkpoints/reasoner_stage2/model.safetensors
+          --input data/eval.jsonl
+          --output-dir results/comparisons/ladir_stage2
+          --num-samples 100
+          --num-steps 50
+          --initial-noise-scale 2
+          --diversity-scale 0.8
+          --checker last_number
+
+  objective:
+    command: bash scripts/train_reasoner_stage1.sh
+    name_template: objective-{objective}
+    dimensions:
+      objective:
+        values: [mse, x0, epsilon, v, flow]
+        arguments:
+          - model.objective={value}
+    derived_args:
+      - run_name={name}
+      - trainer.output_dir=checkpoints/ablations/{name}
+
+  loss_heads:
+    command: bash scripts/train_reasoner_stage1.sh
+    name_template: loss-answer{answer}-special{special}
+    dimensions:
+      answer:
+        values: [0, 1]
+        arguments:
+          - model.lambda_answer={value}
+      special:
+        values: [0, 1]
+        arguments:
+          - model.lambda_special={value}
+    derived_args:
+      - run_name={name}
+      - trainer.output_dir=checkpoints/ablations/{name}
+
+  target_block_sampling:
+    command: bash scripts/train_reasoner_stage1.sh
+    name_template: target-block-{sampling}
+    dimensions:
+      sampling:
+        values: [all, random]
+        arguments:
+          - model.target_block_sampling={value}
+    derived_args:
+      - run_name={name}
+      - trainer.output_dir=checkpoints/ablations/{name}
+
+  block_size:
+    command: bash scripts/train_reasoner_stage1.sh
+    name_template: block-size-{tokens}
+    dimensions:
+      tokens:
+        values: [1, 4, 6, 16]
+        arguments:
+          - model.latent_tokens_per_block={value}
+          - data.train_manifest=data/reasoner_train_n{value}/manifest.jsonl
+          - data.train_latents=data/reasoner_train_n{value}/latents.npy
+          - data.train_metadata=data/reasoner_train_n{value}/metadata.json
+    derived_args:
+      - run_name={name}
+      - trainer.output_dir=checkpoints/ablations/{name}
+
+  denoising_steps:
+    command: python evaluate.py ladir
+    fixed_args:
+      - --config=configs/reasoner_stage2.yaml
+      - --checkpoint=checkpoints/reasoner_stage2/model.safetensors
+      - --input=data/eval.jsonl
+      - --num-samples=100
+      - --initial-noise-scale=2
+      - --diversity-scale=0.8
+      - --checker=last_number
+    name_template: inference-steps-{steps}
+    dimensions:
+      steps:
+        values: [5, 10, 30, 50]
+        arguments:
+          - --num-steps={value}
+    derived_args:
+      - --output-dir=results/ablations/{name}
+
+  initial_noise:
+    command: python evaluate.py ladir
+    fixed_args:
+      - --config=configs/reasoner_stage2.yaml
+      - --checkpoint=checkpoints/reasoner_stage2/model.safetensors
+      - --input=data/eval.jsonl
+      - --num-samples=100
+      - --num-steps=50
+      - --diversity-scale=0.8
+      - --checker=last_number
+    name_template: initial-noise-{noise}
+    dimensions:
+      noise:
+        values: [1, 2, 3]
+        arguments:
+          - --initial-noise-scale={value}
+    derived_args:
+      - --output-dir=results/ablations/{name}
+
+  diversity_guidance:
+    command: python evaluate.py ladir
+    fixed_args:
+      - --config=configs/reasoner_stage2.yaml
+      - --checkpoint=checkpoints/reasoner_stage2/model.safetensors
+      - --input=data/eval.jsonl
+      - --num-samples=100
+      - --num-steps=50
+      - --initial-noise-scale=2
+      - --checker=last_number
+    name_template: diversity-{gamma}
+    dimensions:
+      gamma:
+        values: [0, 0.3, 0.5, 0.8, 1.0]
+        arguments:
+          - --diversity-scale={value}
+    derived_args:
+      - --output-dir=results/ablations/{name}
